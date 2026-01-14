@@ -18,6 +18,3 @@ nginx.conf.active
 
 #md
 HEADER_VERSION_IMPLEMENTATION.md
-
-# Agent 内部文档
-.agent
