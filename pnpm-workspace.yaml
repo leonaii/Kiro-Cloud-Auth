@@ -1,0 +1,6 @@
+ignoredBuiltDependencies:
+  - cbor-extract
+  - esbuild
+
+onlyBuiltDependencies:
+  - electron

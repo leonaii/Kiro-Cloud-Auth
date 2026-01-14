@@ -1,0 +1,135 @@
+appId: com.kiro.cloud
+productName: Kiro-Cloud-Auth
+directories:
+  buildResources: build
+
+# 🔥 最大压缩
+compression: maximum
+
+# 🔥 白名单模式：只打包必要文件（云端模式不需要渲染进程代码）
+files:
+  # 主进程编译输出
+  - out/main/**/*
+  # preload 脚本
+  - out/preload/**/*
+  # package.json（必需）
+  - package.json
+  # 排除所有其他文件
+  - '!src/**/*'
+  - '!server/**/*'
+  - '!dist/**/*'
+  - '!dist-web/**/*'
+  - '!release/**/*'
+  - '!src-tauri/**/*'
+  - '!.agent/**/*'
+  - '!.kiro/**/*'
+  - '!.vscode/**/*'
+  - '!out/renderer/**/*'
+  - '!**/*.map'
+  - '!**/*.ts'
+  - '!**/*.tsx'
+  - '!**/*.md'
+  - '!**/node_modules/**/*.map'
+  - '!**/node_modules/**/*.d.ts'
+  - '!**/node_modules/**/README*'
+  - '!**/node_modules/**/CHANGELOG*'
+  - '!**/node_modules/**/test/**'
+  - '!**/node_modules/**/tests/**'
+  - '!**/node_modules/**/__tests__/**'
+  - '!**/node_modules/**/docs/**'
+  - '!**/node_modules/**/example/**'
+  - '!**/node_modules/**/examples/**'
+
+asarUnpack:
+  - resources/*.ico
+
+extraResources:
+  - from: resources/kiro-high-resolution-logo-transparent.ico
+    to: kiro-high-resolution-logo-transparent.ico
+
+protocols:
+  name: Kiro-Cloud-Auth
+  schemes:
+    - kiro
+
+copyright: Copyright 2025 Kiro
+
+# 关键优化和安全加固
+asar: true
+# 注意: asarIntegrity 在 electron-builder 25.x 中不可用，需要升级到更新版本
+# 当前通过代码混淆提供保护
+npmRebuild: false
+buildDependenciesFromSource: false  # 🔥 不从源码构建
+# 🔥 启动速度优化
+nodeGypRebuild: false  # 不重新编译原生模块
+electronLanguages:  # 只打包中文和英文语言包
+  - zh-CN
+  - en-US
+
+win:
+  executableName: kiro-cloud-auth
+  icon: resources/kiro-high-resolution-logo-transparent.ico
+  legalTrademarks: Copyright 2025 Kiro-Cloud-Auth
+  signAndEditExecutable: false
+  sign: null
+  verifyUpdateCodeSignature: false
+  artifactName: Kiro-Cloud-Auth-${version}-${arch}-setup.${ext}
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+portable:
+  artifactName: Kiro-Cloud-Auth-${version}-portable.${ext}
+  unicode: false
+  unpackDirName: Kiro-Cloud-Auth
+
+nsis:
+  artifactName: Kiro-Cloud-Auth-${version}-${arch}-setup.${ext}
+  shortcutName: Kiro-Cloud-Auth
+  uninstallDisplayName: Kiro-Cloud-Auth
+  createDesktopShortcut: always
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  runAfterFinish: true  # 🔥 安装后立即运行
+  installerIcon: resources/kiro-high-resolution-logo-transparent.ico
+  uninstallerIcon: resources/kiro-high-resolution-logo-transparent.ico
+  # NSIS 优化
+  packElevateHelper: false
+  differentialPackage: false
+  # 🔥 启动速度优化
+  deleteAppDataOnUninstall: false  # 卸载时保留数据
+
+mac:
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    - NSCameraUsageDescription: Application requests access to the device's camera.
+    - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
+    - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
+    - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
+  notarize: false
+
+dmg:
+  artifactName: ${name}-${version}-${arch}.${ext}
+
+linux:
+  target:
+    - AppImage
+    - snap
+    - deb
+  maintainer: electronjs.org
+  category: Utility
+
+appImage:
+  artifactName: ${name}-${version}-${arch}.${ext}
+
+snap:
+  publish:
+    provider: generic
+    url: https://example.com/auto-updates
+
+publish:
+  provider: github
+  owner: kiro
+  repo: Kiro-Cloud-Auth

@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Dev Environment",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "powershell -ExecutionPolicy Bypass -File ${workspaceFolder}/dev.ps1",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

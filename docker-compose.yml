@@ -1,0 +1,128 @@
+services:
+  # 主服务实例 1（开启 Token 刷新）- 端口 25001
+  Kiro-Cloud-Auth-1:
+    build: .
+    env_file:
+      - .env
+    network_mode: host
+    environment:
+      # 数据库配置（host 模式可直接用 127.0.0.1）
+      - DB_HOST=${DB_HOST:-127.0.0.1}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_USER=${DB_USER:-kiro}
+      - DB_PASSWORD=${DB_PASSWORD:-pwd}
+      - DB_NAME=${DB_NAME:-kiro}
+      - DB_POOL_SIZE=${DB_POOL_SIZE:-100}
+
+      # 服务配置（实例1 用 25001 端口）
+      - PORT=25001
+      - APP_VERSION=${APP_VERSION:-2.2.11}
+
+      # 服务器标识
+      - SERVER_ID=${SERVER_ID:-local}-1
+
+      # Token 自动刷新（实例1 开启）
+      - DISABLE_TOKEN_REFRESH=${DISABLE_TOKEN_REFRESH:-true}
+
+      # 是否在刷新 Token 时自动绑定机器码
+      - AUTO_BIND_MACHINE_ID=${AUTO_BIND_MACHINE_ID:-false}
+
+      # 是否在刷新 Token 后自动刷新使用量
+      - AUTO_REFRESH_USAGE_AFTER_TOKEN=${AUTO_REFRESH_USAGE_AFTER_TOKEN:-false}
+
+      # Header版本控制（新账号默认使用的版本：1=V1旧版本, 2=V2新版本）
+      - DEFAULT_HEADER_VERSION=${DEFAULT_HEADER_VERSION:-1}
+
+      # 单 Worker 模式
+      - CLUSTER_WORKERS=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:25001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ========== 蓝绿部署已禁用 ==========
+  # 已改回单实例部署模式，以下蓝实例配置已注释
+  # 如需重新启用蓝绿部署，请取消注释并在 run-docker.sh 中设置 ENABLE_BLUE_GREEN=true
+  # ==================================
+
+  # # 蓝绿部署 - 蓝实例（临时实例，用于零停机部署）- 端口 25002
+  # # 注意：此实例仅在部署过程中临时使用，部署完成后会被停止
+  # Kiro-Cloud-Auth-blue:
+  #   build: .
+  #   env_file:
+  #     - .env
+  #   network_mode: host
+  #   environment:
+  #     # 数据库配置
+  #     - DB_HOST=${DB_HOST:-127.0.0.1}
+  #     - DB_PORT=${DB_PORT:-3306}
+  #     - DB_USER=${DB_USER:-kiro}
+  #     - DB_PASSWORD=${DB_PASSWORD:-pwd}
+  #     - DB_NAME=${DB_NAME:-kiro}
+  #     - DB_POOL_SIZE=${DB_POOL_SIZE:-100}
+  #
+  #     # 服务配置（蓝实例用 25002 端口）
+  #     - PORT=25002
+  #     - APP_VERSION=${APP_VERSION:-2.2.11}
+  #
+  #     # 服务器标识
+  #     - SERVER_ID=${SERVER_ID:-local}-blue
+  #
+  #     # Token 自动刷新（蓝实例开启，因为部署期间它是主实例）
+  #     - DISABLE_TOKEN_REFRESH=false
+  #
+  #     # 是否在刷新 Token 时自动绑定机器码
+  #     - AUTO_BIND_MACHINE_ID=${AUTO_BIND_MACHINE_ID:-false}
+  #
+  #     # 是否在刷新 Token 后自动刷新使用量
+  #     - AUTO_REFRESH_USAGE_AFTER_TOKEN=${AUTO_REFRESH_USAGE_AFTER_TOKEN:-false}
+  #
+  #     # Header版本控制（新账号默认使用的版本：1=V1旧版本, 2=V2新版本）
+  #     - DEFAULT_HEADER_VERSION=${DEFAULT_HEADER_VERSION:-1}
+  #
+  #     # 单 Worker 模式
+  #     - CLUSTER_WORKERS=1
+  #   profiles:
+  #     - blue-green  # 只在蓝绿部署时启用
+  #   healthcheck:
+  #     test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:25002/api/health"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 30s
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "3"
+
+  # Nginx 负载均衡入口 - 端口 25000
+  # 注意：nginx 配置文件由 run-docker.sh 根据 ENABLE_SERVICE_2 开关动态选择
+  # - 单实例模式：使用 nginx.conf.active（从 nginx-single.conf 复制）
+  # - 双实例模式：使用 nginx.conf
+  nginx:
+    image: nginx:alpine
+    network_mode: host
+    volumes:
+      - ./nginx.conf.active:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - Kiro-Cloud-Auth-1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:25000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"

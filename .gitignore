@@ -1,0 +1,23 @@
+node_modules
+release
+build
+dist
+out
+.DS_Store
+.eslintcache
+*.log*
+docs
+
+# 开发环境配置
+.env.dev
+.env.local
+.env
+
+# 动态生成的 nginx 配置
+nginx.conf.active
+
+#md
+HEADER_VERSION_IMPLEMENTATION.md
+
+# Agent 内部文档
+.agent
