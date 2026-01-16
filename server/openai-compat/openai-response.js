@@ -52,9 +52,31 @@ export function buildOpenAIResponse(content, model, inputTokens, outputTokens, f
  * @param {string} model - 模型名称
  * @param {string|null} finishReason - 结束原因
  * @param {string} deltaType - delta 类型：'content' 或 'thinking'
+ * @param {boolean} isFirst - 是否为首个 chunk（首个 chunk 需要包含 role: 'assistant'）
  * @returns {string}
  */
-export function buildStreamChunk(content, model, finishReason = null, deltaType = 'content') {
+export function buildStreamChunk(content, model, finishReason = null, deltaType = 'content', isFirst = false) {
+  let delta = {}
+
+  if (finishReason) {
+    // 结束 chunk，delta 为空
+    delta = {}
+  } else if (isFirst) {
+    // 第一个 chunk，包含 role 和 content
+    if (deltaType === 'thinking') {
+      delta = { role: 'assistant', reasoning_content: content }
+    } else {
+      delta = { role: 'assistant', content }
+    }
+  } else {
+    // 后续 chunk，只包含 content
+    if (deltaType === 'thinking') {
+      delta = { reasoning_content: content }
+    } else {
+      delta = { content }
+    }
+  }
+
   const chunk = {
     id: `chatcmpl-${uuidv4()}`,
     object: 'chat.completion.chunk',
@@ -63,11 +85,7 @@ export function buildStreamChunk(content, model, finishReason = null, deltaType 
     choices: [
       {
         index: 0,
-        delta: finishReason ? {} : (
-          deltaType === 'thinking'
-            ? { reasoning_content: content }
-            : { content }
-        ),
+        delta,
         logprobs: null,
         finish_reason: finishReason
       }
