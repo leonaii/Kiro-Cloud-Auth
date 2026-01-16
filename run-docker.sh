@@ -13,10 +13,10 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# 服务名称
-SERVICE_1="Kiro-Cloud-Auth-1"
-SERVICE_2="Kiro-Cloud-Auth-2"
-SERVICE_BLUE="Kiro-Cloud-Auth-blue"
+# 服务名称（必须与 docker-compose.yml 中的服务名称完全一致，包括大小写）
+SERVICE_1="kiro-cloud-auth-1"
+SERVICE_2="kiro-cloud-auth-2"
+SERVICE_BLUE="kiro-cloud-auth-blue"
 NGINX_SERVICE="nginx"
 HEALTH_URL="http://127.0.0.1:25000/api/health"
 HEALTH_URL_GREEN="http://127.0.0.1:25001/api/health"
