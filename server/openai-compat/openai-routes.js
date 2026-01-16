@@ -5,10 +5,14 @@
 
 import { Router } from 'express'
 import { v4 as uuidv4 } from 'uuid'
-import KiroClient, { SUPPORTED_MODELS, checkThinkingMode } from './kiro-client.js'
+import KiroClient, { SUPPORTED_MODELS, checkThinkingMode } from '../kiro/index.js'
 import AccountPool from './account-pool.js'
 import RequestLogger from './request-logger.js'
 import { validateApiKey } from './auth-middleware.js'
+import { getClientIp } from '../utils/request-utils.js'
+import { delay, isRetryableError } from '../utils/retry-utils.js'
+import { convertMessages, extractSystemPrompt, estimateTokens } from './openai-converter.js'
+import { buildOpenAIResponse, buildStreamChunk } from './openai-response.js'
 
 const router = Router()
 let accountPool = null
@@ -18,122 +22,18 @@ let dbPool = null
 
 /**
  * 初始化路由
+ * @param {object} pool - 数据库连接池
+ * @param {object} sysLogger - 系统日志实例
+ * @param {object} sharedAccountPool - 共享的账号池实例（可选，如果不传则创建新实例）
  */
-export function initOpenAIRoutes(pool, sysLogger = null) {
+export function initOpenAIRoutes(pool, sysLogger = null, sharedAccountPool = null) {
   dbPool = pool
   systemLogger = sysLogger
-  accountPool = new AccountPool(dbPool, systemLogger)
+  // 使用共享的 accountPool，如果没有则创建新的
+  accountPool = sharedAccountPool || new AccountPool(dbPool, systemLogger)
   requestLogger = new RequestLogger(dbPool)
   requestLogger.startCleanup()
   return router
-}
-
-/**
- * 估算 token 数量（简单实现）
- */
-function estimateTokens(text) {
-  if (!text) return 0
-  return Math.ceil(text.length / 4)
-}
-
-/**
- * 转换 OpenAI 消息格式到内部格式
- * 支持多模态内容（文本 + 图片）
- */
-function convertMessages(messages) {
-  return messages.map((msg) => {
-    const role = msg.role === 'system' ? 'user' : msg.role
-    // 保持原始 content 格式，支持 string 或 array（多模态）
-    return { role, content: msg.content }
-  })
-}
-
-/**
- * 提取 system prompt
- */
-function extractSystemPrompt(messages) {
-  const systemMsgs = messages.filter((m) => m.role === 'system')
-  if (systemMsgs.length === 0) return null
-  return systemMsgs
-    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
-    .join('\n')
-}
-
-/**
- * 构建 OpenAI 格式的响应
- * @param {string} content - 响应内容
- * @param {string} model - 模型名称
- * @param {number} inputTokens - 输入 token 数
- * @param {number} outputTokens - 输出 token 数
- * @param {string} finishReason - 结束原因
- * @param {Array} contentBlocks - 内容块（包含 text/thinking 类型）
- */
-function buildOpenAIResponse(content, model, inputTokens, outputTokens, finishReason = 'stop', contentBlocks = null) {
-  const response = {
-    id: `chatcmpl-${uuidv4()}`,
-    object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: 'assistant', content },
-        logprobs: null,
-        finish_reason: finishReason
-      }
-    ],
-    usage: {
-      prompt_tokens: inputTokens,
-      completion_tokens: outputTokens,
-      total_tokens: inputTokens + outputTokens
-    }
-  }
-
-  // 如果有 thinking 内容，添加 reasoning_content
-  if (contentBlocks && contentBlocks.length > 0) {
-    const thinkingBlocks = contentBlocks.filter(b => b.type === 'thinking')
-    if (thinkingBlocks.length > 0) {
-      response.choices[0].message.reasoning_content = thinkingBlocks.map(b => b.thinking).join('\n')
-    }
-  }
-
-  return response
-}
-
-/**
- * 构建 SSE 流式响应块
- * @param {string} content - 内容
- * @param {string} model - 模型名称
- * @param {string|null} finishReason - 结束原因
- * @param {string} deltaType - delta 类型：'content' 或 'thinking'
- */
-function buildStreamChunk(content, model, finishReason = null, deltaType = 'content') {
-  const chunk = {
-    id: `chatcmpl-${uuidv4()}`,
-    object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        delta: finishReason ? {} : (
-          deltaType === 'thinking'
-            ? { reasoning_content: content }
-            : { content }
-        ),
-        logprobs: null,
-        finish_reason: finishReason
-      }
-    ]
-  }
-  return `data: ${JSON.stringify(chunk)}\n\n`
-}
-
-/**
- * 获取客户端 IP
- */
-function getClientIp(req) {
-  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.socket?.remoteAddress
 }
 
 // ==================== API 路由 ====================
@@ -182,28 +82,10 @@ router.get('/v1/models/:model', validateApiKey, async (req, res) => {
   })
 })
 
-/**
- * 延迟函数
- */
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+// ==================== API 路由 ====================
 
 /**
- * 判断是否为可重试的错误
- */
-function isRetryableError(error) {
-  const msg = error.message || ''
-  return (
-    msg === 'TOKEN_EXPIRED' ||
-    msg.includes('403') ||
-    msg.includes('401') ||
-    msg.includes('token') ||
-    msg.includes('expired') ||
-    msg.includes('unauthorized')
-  )
-}
-
-/**
- * POST /v1/chat/completions - 聊天补全
+ * GET /v1/models - 列出可用模型
  */
 router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
   const requestId = uuidv4()

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git pull:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(dir:*)",
+      "Bash(node --check:*)"
+    ]
+  }
+}

@@ -4,182 +4,12 @@
  */
 
 import { v4 as uuidv4 } from 'uuid'
-import * as crypto from 'crypto'
-import * as os from 'os'
-import * as http from 'http'
-import * as https from 'https'
-import { generateHeaders, getEndpointUrl } from '../utils/header-generator.js'
-import SystemLogger from './system-logger.js'
-
-// Thinking 模式常量
-const THINKING_START_TAG = '<thinking>';
-const THINKING_END_TAG = '</thinking>';
-const KIRO_MAX_OUTPUT_TOKENS = 32000;
-const KIRO_MAX_TOOL_DESC_LEN = 10237;
-const KIRO_MAX_TOOL_NAME_LEN = 64;
-
-const KIRO_CONSTANTS = {
-  REFRESH_URL: 'https://prod.{{region}}.auth.desktop.kiro.dev/refreshToken',
-  REFRESH_IDC_URL: 'https://oidc.{{region}}.amazonaws.com/token',
-  // V1: codewhisperer.{{region}}.amazonaws.com
-  BASE_URL_V1: 'https://codewhisperer.{{region}}.amazonaws.com/generateAssistantResponse',
-  // V2: q.{{region}}.amazonaws.com
-  BASE_URL_V2: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse',
-  AXIOS_TIMEOUT: 120000,
-  CHAT_TRIGGER_TYPE_MANUAL: 'MANUAL',
-  ORIGIN_AI_EDITOR: 'AI_EDITOR',
-}
-
-// 模型映射
-const MODEL_MAPPING = {
-  'claude-opus-4-5': 'claude-opus-4.5',
-  'claude-haiku-4-5': 'claude-haiku-4.5',
-  'claude-sonnet-4-5': 'CLAUDE_SONNET_4_5_20250929_V1_0',
-}
-
-const SUPPORTED_MODELS = Object.keys(MODEL_MAPPING)
-
-// 移除 getMacAddressSha256 函数
-// Kiro_New 使用的是随机生成的机器 ID (UUID v4)，而不是基于 MAC 地址生成的
-// 使用 MAC 地址会暴露真实硬件信息，且容易导致指纹不一致
-
-// HTTP Agent 复用 - 针对 12核12G 服务器优化
-// 增加超时时间以支持大上下文请求（200k tokens）
-const httpAgent = new http.Agent({
-  keepAlive: true,
-  maxSockets: 500, // 高并发连接数
-  maxFreeSockets: 50, // 保持更多空闲连接
-  timeout: 600000, // 10分钟，支持大上下文
-  scheduling: 'fifo'
-})
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 500,
-  maxFreeSockets: 50,
-  timeout: 600000, // 10分钟，支持大上下文
-  scheduling: 'fifo',
-  // TLS 会话复用
-  maxCachedSessions: 100
-})
-
-// 默认请求超时时间（毫秒）- 用于 AbortController
-const DEFAULT_REQUEST_TIMEOUT = 600000 // 10分钟
-
-// 创建带超时的 fetch 请求
-async function fetchWithTimeout(url, options, timeoutMs = DEFAULT_REQUEST_TIMEOUT) {
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
-  
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    })
-    return response
-  } finally {
-    clearTimeout(timeoutId)
-  }
-}
-
-// 检查是否启用了 Thinking 模式
-function checkThinkingMode(requestBody) {
-  let enabled = false;
-  let budgetTokens = 16000;
-
-  // Claude API 格式
-  if (requestBody.thinking?.type === 'enabled') {
-    enabled = true;
-    if (requestBody.thinking.budget_tokens > 0) {
-      budgetTokens = requestBody.thinking.budget_tokens;
-    }
-  }
-
-  // OpenAI 格式 (reasoning_effort)
-  if (!enabled && requestBody.reasoning_effort) {
-    const effort = requestBody.reasoning_effort;
-    if (effort && effort !== 'none') {
-      enabled = true;
-      switch (effort) {
-        case 'low': budgetTokens = 8000; break;
-        case 'medium': budgetTokens = 16000; break;
-        case 'high': budgetTokens = 24000; break;
-        default: budgetTokens = 16000;
-      }
-    }
-  }
-
-  // AMP/Cursor 格式 - 检查系统提示中的 thinking_mode 标签
-  if (!enabled && requestBody.system) {
-    const systemStr = typeof requestBody.system === 'string'
-      ? requestBody.system
-      : JSON.stringify(requestBody.system);
-    if (systemStr.includes('<thinking_mode>') && systemStr.includes('</thinking_mode>')) {
-      const startIdx = systemStr.indexOf('<thinking_mode>') + 15;
-      const endIdx = systemStr.indexOf('</thinking_mode>', startIdx);
-      if (endIdx > startIdx) {
-        const thinkingMode = systemStr.substring(startIdx, endIdx);
-        if (thinkingMode === 'interleaved' || thinkingMode === 'enabled') {
-          enabled = true;
-          const lengthMatch = systemStr.match(/<max_thinking_length>(\d+)<\/max_thinking_length>/);
-          if (lengthMatch) budgetTokens = parseInt(lengthMatch[1], 10);
-        }
-      }
-    }
-  }
-
-  return { enabled, budgetTokens };
-}
-
-// 从响应内容中提取 thinking 块
-function extractThinkingFromContent(content) {
-  const blocks = [];
-  if (!content) return blocks;
-  if (!content.includes(THINKING_START_TAG)) {
-    return [{ type: 'text', text: content }];
-  }
-
-  let remaining = content;
-  while (remaining.length > 0) {
-    const startIdx = remaining.indexOf(THINKING_START_TAG);
-    if (startIdx === -1) {
-      if (remaining.trim()) blocks.push({ type: 'text', text: remaining });
-      break;
-    }
-    if (startIdx > 0) {
-      const textBefore = remaining.substring(0, startIdx);
-      if (textBefore.trim()) blocks.push({ type: 'text', text: textBefore });
-    }
-    remaining = remaining.substring(startIdx + THINKING_START_TAG.length);
-    const endIdx = remaining.indexOf(THINKING_END_TAG);
-    if (endIdx === -1) {
-      if (remaining.trim()) blocks.push({ type: 'thinking', thinking: remaining });
-      break;
-    }
-    const thinkContent = remaining.substring(0, endIdx);
-    if (thinkContent.trim()) blocks.push({ type: 'thinking', thinking: thinkContent });
-    remaining = remaining.substring(endIdx + THINKING_END_TAG.length);
-  }
-  if (blocks.length === 0) blocks.push({ type: 'text', text: '' });
-  return blocks;
-}
-
-// 截断工具名称（Kiro 限制 64 字符）
-function shortenToolNameIfNeeded(name) {
-  if (!name || name.length <= KIRO_MAX_TOOL_NAME_LEN) return name;
-  // 保留前32和后31字符，中间用_连接
-  return name.substring(0, 32) + '_' + name.substring(name.length - 31);
-}
-
-// 处理工具描述（空描述默认值，长度截断）
-function processToolDescription(description) {
-  if (!description || description.trim() === '') {
-    return 'No description provided';
-  }
-  if (description.length > KIRO_MAX_TOOL_DESC_LEN) {
-    return description.substring(0, KIRO_MAX_TOOL_DESC_LEN - 3) + '...';
-  }
-  return description;
-}
+import { generateHeaders } from '../utils/header-generator.js'
+import { fetchWithTimeout, DEFAULT_REQUEST_TIMEOUT } from '../utils/fetch-utils.js'
+import { checkThinkingMode, extractThinkingFromContent, THINKING_START_TAG, THINKING_END_TAG } from '../utils/thinking-utils.js'
+import { KIRO_CONSTANTS, MODEL_MAPPING } from './constants.js'
+import { httpAgent, httpsAgent } from './http-agent.js'
+import { shortenToolNameIfNeeded, processToolDescription } from './tool-utils.js'
 
 class KiroClient {
   constructor(account, systemLogger = null) {
@@ -198,10 +28,10 @@ class KiroClient {
       ? KIRO_CONSTANTS.BASE_URL_V2
       : KIRO_CONSTANTS.BASE_URL_V1
     this.baseUrl = baseUrlTemplate.replace('{{region}}', this.region)
-    
+
     this.refreshUrl = KIRO_CONSTANTS.REFRESH_URL.replace('{{region}}', this.region)
     this.refreshIdcUrl = KIRO_CONSTANTS.REFRESH_IDC_URL.replace('{{region}}', this.region)
-    
+
     console.log(`[KiroClient] Initialized for ${account.email} with Header V${this.headerVersion}, endpoint: ${this.baseUrl}`)
   }
 
@@ -270,7 +100,7 @@ class KiroClient {
     const kiroModel = MODEL_MAPPING[model] || MODEL_MAPPING['claude-sonnet-4-5']
 
     // 检查 thinking 模式
-    const { enabled: thinkingEnabled, budgetTokens } = checkThinkingMode(requestBody || {});
+    const { enabled: thinkingEnabled, budgetTokens } = checkThinkingMode(requestBody || {})
 
     // 处理消息
     const processedMessages = [...messages]
@@ -294,11 +124,11 @@ class KiroClient {
     let startIndex = 0
 
     // 处理 system prompt，如果启用了 thinking 模式则注入提示
-    let finalSystemPrompt = systemPrompt;
+    let finalSystemPrompt = systemPrompt
     if (thinkingEnabled) {
-      const thinkingHint = `<thinking_mode>interleaved</thinking_mode><max_thinking_length>${budgetTokens}</max_thinking_length>`;
-      finalSystemPrompt = finalSystemPrompt ? finalSystemPrompt + '\n' + thinkingHint : thinkingHint;
-      console.log(`[KiroClient] Thinking mode enabled, budget_tokens: ${budgetTokens}`);
+      const thinkingHint = `<thinking_mode>interleaved</thinking_mode><max_thinking_length>${budgetTokens}</max_thinking_length>`
+      finalSystemPrompt = finalSystemPrompt ? finalSystemPrompt + '\n' + thinkingHint : thinkingHint
+      console.log(`[KiroClient] Thinking mode enabled, budget_tokens: ${budgetTokens}`)
     }
 
     if (finalSystemPrompt) {
@@ -453,7 +283,7 @@ class KiroClient {
     }
 
     // 提取 thinking 块
-    const contentBlocks = extractThinkingFromContent(fullContent);
+    const contentBlocks = extractThinkingFromContent(fullContent)
 
     return {
       content: fullContent,
@@ -536,7 +366,7 @@ class KiroClient {
     const requestStartTime = Date.now()
 
     // 检查是否启用了 thinking 模式
-    const { enabled: thinkingEnabled } = checkThinkingMode(options.requestBody || {});
+    const { enabled: thinkingEnabled } = checkThinkingMode(options.requestBody || {})
 
     // 使用统一的 header 生成器，根据账号的 headerVersion 自动选择版本
     let headers = generateHeaders(this.account, this.accessToken)
@@ -603,11 +433,11 @@ class KiroClient {
       } catch (e) {
         console.error('[KiroClient] Failed to read error response body:', e.message)
       }
-      
+
       if (response.status === 403) {
         throw new Error('TOKEN_EXPIRED')
       }
-      
+
       // 尝试解析错误信息
       let errorMessage = `API call failed: ${response.status}`
       try {
@@ -623,7 +453,7 @@ class KiroClient {
           errorMessage = `API call failed: ${response.status} - ${errorBody.substring(0, 200)}`
         }
       }
-      
+
       throw new Error(errorMessage)
     }
 
@@ -632,9 +462,9 @@ class KiroClient {
     let buffer = ''
 
     // Thinking 模式状态跟踪
-    let inThinkingBlock = false;
-    let thinkingBuffer = '';
-    let contentBuffer = '';
+    let inThinkingBlock = false
+    let thinkingBuffer = ''
+    let contentBuffer = ''
 
     try {
       while (true) {
@@ -684,57 +514,57 @@ class KiroClient {
           try {
             const parsed = JSON.parse(jsonStr)
             if (parsed.content) {
-              const chunk = parsed.content;
+              const chunk = parsed.content
 
               // 如果启用了 thinking 模式，处理 thinking 标签
               if (thinkingEnabled) {
                 // 将 chunk 添加到适当的缓冲区并检测标签
-                let remaining = chunk;
+                let remaining = chunk
 
                 while (remaining.length > 0) {
                   if (!inThinkingBlock) {
                     // 不在 thinking 块中，查找开始标签
-                    const thinkStartIdx = remaining.indexOf(THINKING_START_TAG);
+                    const thinkStartIdx = remaining.indexOf(THINKING_START_TAG)
                     if (thinkStartIdx === -1) {
                       // 没有开始标签，全部是普通内容
-                      contentBuffer += remaining;
+                      contentBuffer += remaining
                       if (contentBuffer.length > 0) {
-                        yield { type: 'content', content: contentBuffer };
-                        contentBuffer = '';
+                        yield { type: 'content', content: contentBuffer }
+                        contentBuffer = ''
                       }
-                      remaining = '';
+                      remaining = ''
                     } else {
                       // 找到开始标签
                       if (thinkStartIdx > 0) {
                         // 标签前有内容
-                        const beforeTag = remaining.substring(0, thinkStartIdx);
-                        yield { type: 'content', content: beforeTag };
+                        const beforeTag = remaining.substring(0, thinkStartIdx)
+                        yield { type: 'content', content: beforeTag }
                       }
-                      inThinkingBlock = true;
-                      remaining = remaining.substring(thinkStartIdx + THINKING_START_TAG.length);
+                      inThinkingBlock = true
+                      remaining = remaining.substring(thinkStartIdx + THINKING_START_TAG.length)
                       // 发送 thinking 开始事件
-                      yield { type: 'thinking_start' };
+                      yield { type: 'thinking_start' }
                     }
                   } else {
                     // 在 thinking 块中，查找结束标签
-                    const thinkEndIdx = remaining.indexOf(THINKING_END_TAG);
+                    const thinkEndIdx = remaining.indexOf(THINKING_END_TAG)
                     if (thinkEndIdx === -1) {
                       // 没有结束标签，全部是 thinking 内容
-                      thinkingBuffer += remaining;
-                      yield { type: 'thinking', thinking: remaining };
-                      remaining = '';
+                      thinkingBuffer += remaining
+                      yield { type: 'thinking', thinking: remaining }
+                      remaining = ''
                     } else {
                       // 找到结束标签
                       if (thinkEndIdx > 0) {
-                        const thinkContent = remaining.substring(0, thinkEndIdx);
-                        thinkingBuffer += thinkContent;
-                        yield { type: 'thinking', thinking: thinkContent };
+                        const thinkContent = remaining.substring(0, thinkEndIdx)
+                        thinkingBuffer += thinkContent
+                        yield { type: 'thinking', thinking: thinkContent }
                       }
-                      inThinkingBlock = false;
+                      inThinkingBlock = false
                       // 发送 thinking 结束事件
-                      yield { type: 'thinking_end', thinking: thinkingBuffer };
-                      thinkingBuffer = '';
-                      remaining = remaining.substring(thinkEndIdx + THINKING_END_TAG.length);
+                      yield { type: 'thinking_end', thinking: thinkingBuffer }
+                      thinkingBuffer = ''
+                      remaining = remaining.substring(thinkEndIdx + THINKING_END_TAG.length)
                     }
                   }
                 }
@@ -760,7 +590,7 @@ class KiroClient {
 
       // 处理流结束时可能残留的内容
       if (thinkingEnabled && contentBuffer.length > 0) {
-        yield { type: 'content', content: contentBuffer };
+        yield { type: 'content', content: contentBuffer }
       }
     } finally {
       reader.releaseLock()
@@ -768,7 +598,7 @@ class KiroClient {
   }
 
   static getSupportedModels() {
-    return SUPPORTED_MODELS
+    return Object.keys(MODEL_MAPPING)
   }
 
   static getModelMapping() {
@@ -777,4 +607,3 @@ class KiroClient {
 }
 
 export default KiroClient
-export { SUPPORTED_MODELS, MODEL_MAPPING, checkThinkingMode }

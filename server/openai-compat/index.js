@@ -1,24 +1,21 @@
 /**
- * OpenAI 兼容 API 模块
- *
- * 提供标准 OpenAI API 接口，使用数据库中的账号池进行负载均衡
- *
- * 支持的端点：
- * - GET  /v1/models          - 列出可用模型
- * - GET  /v1/models/:model   - 获取模型详情
- * - POST /v1/chat/completions - 聊天补全（支持流式）
- * - GET  /v1/pool/status     - 获取账号池状态
- * - POST /v1/pool/refresh    - 刷新账号池缓存
- *
- * 使用示例：
- * ```javascript
- * import { initOpenAIRoutes } from './openai-compat/index.js'
- *
- * const openaiRoutes = initOpenAIRoutes(mysqlPool)
- * app.use(openaiRoutes)
- * ```
+ * OpenAI 兼容模块统一导出
  */
 
-export { initOpenAIRoutes, default as openaiRouter } from './openai-routes.js'
+// 导出转换器
+export { convertMessages, extractSystemPrompt, estimateTokens } from './openai-converter.js'
+
+// 导出响应构建器
+export { buildOpenAIResponse, buildStreamChunk } from './openai-response.js'
+
+// 导出路由初始化函数
+export { initOpenAIRoutes, default } from './openai-routes.js'
+
+// 导出账号池
 export { default as AccountPool } from './account-pool.js'
-export { default as KiroClient, SUPPORTED_MODELS, MODEL_MAPPING } from './kiro-client.js'
+
+// 导出认证中间件
+export { validateApiKey } from './auth-middleware.js'
+
+// 导出请求日志
+export { default as RequestLogger } from './request-logger.js'

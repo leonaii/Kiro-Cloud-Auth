@@ -52,3 +52,4 @@ ACTIVE_POOL_COOLING_PERIOD_MS=3600000
 # 设为 true 时，只刷新活跃池中账号的 Token
 # 设为 false 时，刷新所有即将过期的账号 Token
 TOKEN_REFRESH_ACTIVE_POOL_ONLY=true
+ENABLE_CLAUDE_API = false

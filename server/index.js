@@ -44,7 +44,7 @@ import { requireAuth } from './middleware/auth-middleware.js'
 import { initOpenAIRoutes } from './openai-compat/openai-routes.js'
 
 // Claude 兼容 API
-import { initClaudeRoutes } from './openai-compat/claude-routes.js'
+import { initClaudeRoutes } from './claude-compat/index.js'
 
 // 账号池管理
 import AccountPool from './openai-compat/account-pool.js'
@@ -113,8 +113,15 @@ const openaiRoutes = initOpenAIRoutes(pool, systemLogger, accountPool)
 app.use(openaiRoutes)
 
 // Claude 兼容 API（传入共享的 accountPool）
-const claudeRoutes = initClaudeRoutes(pool, systemLogger, accountPool)
-app.use(claudeRoutes)
+// 可通过环境变量 ENABLE_CLAUDE_API=false 禁用
+const enableClaudeApi = process.env.ENABLE_CLAUDE_API !== 'false'
+if (enableClaudeApi) {
+  const claudeRoutes = initClaudeRoutes(pool, systemLogger, accountPool)
+  app.use(claudeRoutes)
+  console.log('[Server] Claude API enabled')
+} else {
+  console.log('[Server] Claude API disabled (ENABLE_CLAUDE_API=false)')
+}
 
 // 系统日志 API
 app.get('/api/system-logs', async (req, res) => {
