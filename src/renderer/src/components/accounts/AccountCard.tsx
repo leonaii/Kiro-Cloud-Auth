@@ -180,8 +180,14 @@ export const AccountCard = memo(function AccountCard({
     : account.createdAt
       ? account.createdAt + 30 * 24 * 60 * 60 * 1000
       : undefined
+  // 使用 Math.ceil 确保剩余时间不足 1 天但未过期时显示"1天"而不是"已过期"
+  // 只有当差值 <= 0 时才真正过期
   const freeTrialDaysRemaining = freeTrialExpiry
-    ? Math.floor((freeTrialExpiry - Date.now()) / (24 * 60 * 60 * 1000))
+    ? (() => {
+        const diffMs = freeTrialExpiry - Date.now()
+        if (diffMs <= 0) return 0  // 真正过期
+        return Math.ceil(diffMs / (24 * 60 * 60 * 1000))  // 向上取整，不足1天显示1天
+      })()
     : undefined
   const isExpiringSoon = freeTrialDaysRemaining !== undefined && freeTrialDaysRemaining <= 7
   const isHighUsage = account.usage.percentUsed > 80
