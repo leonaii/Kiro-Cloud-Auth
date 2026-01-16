@@ -163,6 +163,211 @@ function extractThinkingFromContent(content) {
   return blocks;
 }
 
+// Helper functions for tool calls and JSON parsing (参照 claude-kiro.js)
+
+function isQuoteCharAt(text, index) {
+  if (index < 0 || index >= text.length) return false
+  const ch = text[index]
+  return ch === '"' || ch === "'" || ch === '`'
+}
+
+function findRealTag(text, tag, startIndex = 0) {
+  let searchStart = Math.max(0, startIndex)
+  while (true) {
+    const pos = text.indexOf(tag, searchStart)
+    if (pos === -1) return -1
+    
+    const hasQuoteBefore = isQuoteCharAt(text, pos - 1)
+    const hasQuoteAfter = isQuoteCharAt(text, pos + tag.length)
+    if (!hasQuoteBefore && !hasQuoteAfter) {
+      return pos
+    }
+    
+    searchStart = pos + 1
+  }
+}
+
+/**
+ * 通用的括号匹配函数 - 支持多种括号类型
+ */
+function findMatchingBracket(text, startPos, openChar = '[', closeChar = ']') {
+  if (!text || startPos >= text.length || text[startPos] !== openChar) {
+    return -1
+  }
+
+  let bracketCount = 1
+  let inString = false
+  let escapeNext = false
+
+  for (let i = startPos + 1; i < text.length; i++) {
+    const char = text[i]
+
+    if (escapeNext) {
+      escapeNext = false
+      continue
+    }
+
+    if (char === '\\' && inString) {
+      escapeNext = true
+      continue
+    }
+
+    if (char === '"' && !escapeNext) {
+      inString = !inString
+      continue
+    }
+
+    if (!inString) {
+      if (char === openChar) {
+        bracketCount++
+      } else if (char === closeChar) {
+        bracketCount--
+        if (bracketCount === 0) {
+          return i
+        }
+      }
+    }
+  }
+  return -1
+}
+
+/**
+ * 尝试修复常见的 JSON 格式问题
+ */
+function repairJson(jsonStr) {
+  let repaired = jsonStr
+  // 移除尾部逗号
+  repaired = repaired.replace(/,\s*([}\]])/g, '$1')
+  // 为未引用的键添加引号
+  repaired = repaired.replace(/([{,]\s*)([a-zA-Z0-9_]+?)\s*:/g, '$1"$2":')
+  // 确保字符串值被正确引用
+  repaired = repaired.replace(/:\s*([a-zA-Z0-9_]+)(?=[,\}\]])/g, ':"$1"')
+  return repaired
+}
+
+/**
+ * 解析单个工具调用文本
+ */
+function parseSingleToolCall(toolCallText) {
+  const namePattern = /\[Called\s+(\w+)\s+with\s+args:/i
+  const nameMatch = toolCallText.match(namePattern)
+
+  if (!nameMatch) {
+    return null
+  }
+
+  const functionName = nameMatch[1].trim()
+  const argsStartMarker = "with args:"
+  const argsStartPos = toolCallText.toLowerCase().indexOf(argsStartMarker.toLowerCase())
+
+  if (argsStartPos === -1) {
+    return null
+  }
+
+  const argsStart = argsStartPos + argsStartMarker.length
+  const argsEnd = toolCallText.lastIndexOf(']')
+
+  if (argsEnd <= argsStart) {
+    return null
+  }
+
+  const jsonCandidate = toolCallText.substring(argsStart, argsEnd).trim()
+
+  try {
+    const repairedJson = repairJson(jsonCandidate)
+    const argumentsObj = JSON.parse(repairedJson)
+
+    if (typeof argumentsObj !== 'object' || argumentsObj === null) {
+      return null
+    }
+
+    const toolCallId = `call_${uuidv4().replace(/-/g, '').substring(0, 8)}`
+    return {
+      id: toolCallId,
+      type: "function",
+      function: {
+        name: functionName,
+        arguments: JSON.stringify(argumentsObj)
+      }
+    }
+  } catch (e) {
+    console.error(`[KiroClient] Failed to parse tool call arguments: ${e.message}`, jsonCandidate)
+    return null
+  }
+}
+
+/**
+ * 解析 bracket 格式的工具调用 [Called xxx with args: {...}]
+ */
+function parseBracketToolCalls(responseText) {
+  if (!responseText || !responseText.includes("[Called")) {
+    return null
+  }
+
+  const toolCalls = []
+  const callPositions = []
+  let start = 0
+  while (true) {
+    const pos = responseText.indexOf("[Called", start)
+    if (pos === -1) {
+      break
+    }
+    callPositions.push(pos)
+    start = pos + 1
+  }
+
+  for (let i = 0; i < callPositions.length; i++) {
+    const startPos = callPositions[i]
+    let endSearchLimit
+    if (i + 1 < callPositions.length) {
+      endSearchLimit = callPositions[i + 1]
+    } else {
+      endSearchLimit = responseText.length
+    }
+
+    const segment = responseText.substring(startPos, endSearchLimit)
+    const bracketEnd = findMatchingBracket(segment, 0)
+
+    let toolCallText
+    if (bracketEnd !== -1) {
+      toolCallText = segment.substring(0, bracketEnd + 1)
+    } else {
+      // Fallback: if no matching bracket, try to find the last ']' in the segment
+      const lastBracket = segment.lastIndexOf(']')
+      if (lastBracket !== -1) {
+        toolCallText = segment.substring(0, lastBracket + 1)
+      } else {
+        continue // Skip this one if no closing bracket found
+      }
+    }
+    
+    const parsedCall = parseSingleToolCall(toolCallText)
+    if (parsedCall) {
+      toolCalls.push(parsedCall)
+    }
+  }
+  return toolCalls.length > 0 ? toolCalls : null
+}
+
+/**
+ * 去重工具调用
+ */
+function deduplicateToolCalls(toolCalls) {
+  const seen = new Set()
+  const uniqueToolCalls = []
+
+  for (const tc of toolCalls) {
+    const key = `${tc.function.name}-${tc.function.arguments}`
+    if (!seen.has(key)) {
+      seen.add(key)
+      uniqueToolCalls.push(tc)
+    } else {
+      console.log(`[KiroClient] Skipping duplicate tool call: ${tc.function.name}`)
+    }
+  }
+  return uniqueToolCalls
+}
+
 // 截断工具名称（Kiro 限制 64 字符）
 function shortenToolNameIfNeeded(name) {
   if (!name || name.length <= KIRO_MAX_TOOL_NAME_LEN) return name;
@@ -712,17 +917,55 @@ class KiroClient {
     return assistantResponseMessage
   }
 
+  /**
+   * 提取消息内容的文本（参照 claude-kiro.js 的实现）
+   * 支持多种格式：字符串、消息对象、内容块数组
+   */
   getContentText(message) {
-    if (!message) return ''
-    if (typeof message === 'string') return message
-    if (typeof message.content === 'string') return message.content
-    if (Array.isArray(message.content)) {
-      return message.content
-        .filter(p => p.type === 'text')
-        .map(p => p.text)
-        .join('')
+    if (message == null) {
+      return ''
     }
-    return String(message.content || message)
+    // 如果直接传入的是数组（内容块数组）
+    if (Array.isArray(message)) {
+      return message.map(part => {
+        if (typeof part === 'string') return part
+        if (part && typeof part === 'object') {
+          if (part.type === 'text' && part.text) return part.text
+          if (part.text) return part.text
+        }
+        return ''
+      }).join('')
+    }
+    // 如果是字符串
+    if (typeof message === 'string') {
+      return message
+    }
+    // 如果是消息对象，检查 content 属性
+    if (typeof message.content === 'string') {
+      return message.content
+    }
+    // 如果 content 是数组
+    if (Array.isArray(message.content)) {
+      return message.content.map(part => {
+        if (typeof part === 'string') return part
+        if (part && typeof part === 'object') {
+          if (part.type === 'text' && part.text) return part.text
+          if (part.text) return part.text
+        }
+        return ''
+      }).join('')
+    }
+    // 最后的回退：尝试转换为字符串，但避免 [object Object]
+    if (message.content != null) {
+      if (typeof message.content === 'object') {
+        return JSON.stringify(message.content)
+      }
+      return String(message.content)
+    }
+    if (typeof message === 'object') {
+      return JSON.stringify(message)
+    }
+    return String(message)
   }
 
   mergeContent(content1, content2) {
@@ -963,9 +1206,14 @@ class KiroClient {
     let buffer = ''
 
     // Thinking 模式状态跟踪
-    let inThinkingBlock = false;
-    let thinkingBuffer = '';
-    let contentBuffer = '';
+    let inThinkingBlock = false
+    let thinkingBuffer = ''
+    let contentBuffer = ''
+    
+    // 工具调用状态跟踪
+    let currentToolCall = null
+    let totalContent = ''
+    let lastContentEvent = null // 用于检测连续重复的 content 事件
 
     try {
       while (true) {
@@ -974,128 +1222,287 @@ class KiroClient {
 
         buffer += decoder.decode(value, { stream: true })
 
-        // 解析 buffer 中所有完整的 {"content":"..."} 对象
-        const startMarker = '{"content":"'
-        let pos = 0
-        let lastProcessedEnd = 0
+        // 解析 AWS Event Stream 格式的事件（参照 claude-kiro.js 的 parseAwsEventStreamBuffer）
+        const { events, remaining } = this.parseAwsEventStreamBuffer(buffer)
+        buffer = remaining
 
-        while (pos < buffer.length) {
-          const startIdx = buffer.indexOf(startMarker, pos)
-          if (startIdx === -1) break
-
-          const contentStart = startIdx + startMarker.length
-
-          // 找到字符串结束的位置
-          let contentEnd = contentStart
-          let foundEnd = false
-          while (contentEnd < buffer.length) {
-            if (buffer[contentEnd] === '"') {
-              // 检查是否是转义的引号
-              let backslashCount = 0
-              let checkPos = contentEnd - 1
-              while (checkPos >= contentStart && buffer[checkPos] === '\\') {
-                backslashCount++
-                checkPos--
-              }
-              // 偶数个反斜杠意味着引号没有被转义
-              if (backslashCount % 2 === 0) {
-                foundEnd = true
-                break
-              }
+        // 处理所有解析出的事件
+        for (const event of events) {
+          if (event.type === 'content' && event.data) {
+            // 检查是否与上一个 content 事件完全相同（Kiro API 有时会重复发送）
+            if (lastContentEvent === event.data) {
+              continue
             }
-            contentEnd++
-          }
+            lastContentEvent = event.data
+            totalContent += event.data
 
-          if (!foundEnd) {
-            // 没找到结束引号，保留这部分到下次处理
-            break
-          }
+            // 如果启用了 thinking 模式，处理 thinking 标签
+            if (thinkingEnabled) {
+              let remaining = event.data
 
-          const jsonStr = buffer.substring(startIdx, contentEnd + 2) // 包含 "}
-          try {
-            const parsed = JSON.parse(jsonStr)
-            if (parsed.content) {
-              const chunk = parsed.content;
-
-              // 如果启用了 thinking 模式，处理 thinking 标签
-              if (thinkingEnabled) {
-                // 将 chunk 添加到适当的缓冲区并检测标签
-                let remaining = chunk;
-
-                while (remaining.length > 0) {
-                  if (!inThinkingBlock) {
-                    // 不在 thinking 块中，查找开始标签
-                    const thinkStartIdx = remaining.indexOf(THINKING_START_TAG);
-                    if (thinkStartIdx === -1) {
-                      // 没有开始标签，全部是普通内容
-                      contentBuffer += remaining;
-                      if (contentBuffer.length > 0) {
-                        yield { type: 'content', content: contentBuffer };
-                        contentBuffer = '';
-                      }
-                      remaining = '';
-                    } else {
-                      // 找到开始标签
-                      if (thinkStartIdx > 0) {
-                        // 标签前有内容
-                        const beforeTag = remaining.substring(0, thinkStartIdx);
-                        yield { type: 'content', content: beforeTag };
-                      }
-                      inThinkingBlock = true;
-                      remaining = remaining.substring(thinkStartIdx + THINKING_START_TAG.length);
-                      // 发送 thinking 开始事件
-                      yield { type: 'thinking_start' };
+              while (remaining.length > 0) {
+                if (!inThinkingBlock) {
+                  // 不在 thinking 块中，查找开始标签
+                  const thinkStartIdx = findRealTag(remaining, THINKING_START_TAG)
+                  if (thinkStartIdx === -1) {
+                    // 没有开始标签，全部是普通内容
+                    contentBuffer += remaining
+                    if (contentBuffer.length > 0) {
+                      yield { type: 'content', content: contentBuffer }
+                      contentBuffer = ''
                     }
+                    remaining = ''
                   } else {
-                    // 在 thinking 块中，查找结束标签
-                    const thinkEndIdx = remaining.indexOf(THINKING_END_TAG);
-                    if (thinkEndIdx === -1) {
-                      // 没有结束标签，全部是 thinking 内容
-                      thinkingBuffer += remaining;
-                      yield { type: 'thinking', thinking: remaining };
-                      remaining = '';
-                    } else {
-                      // 找到结束标签
-                      if (thinkEndIdx > 0) {
-                        const thinkContent = remaining.substring(0, thinkEndIdx);
-                        thinkingBuffer += thinkContent;
-                        yield { type: 'thinking', thinking: thinkContent };
-                      }
-                      inThinkingBlock = false;
-                      // 发送 thinking 结束事件
-                      yield { type: 'thinking_end', thinking: thinkingBuffer };
-                      thinkingBuffer = '';
-                      remaining = remaining.substring(thinkEndIdx + THINKING_END_TAG.length);
+                    // 找到开始标签
+                    if (thinkStartIdx > 0) {
+                      const beforeTag = remaining.substring(0, thinkStartIdx)
+                      yield { type: 'content', content: beforeTag }
                     }
+                    inThinkingBlock = true
+                    remaining = remaining.substring(thinkStartIdx + THINKING_START_TAG.length)
+                    yield { type: 'thinking_start' }
+                  }
+                } else {
+                  // 在 thinking 块中，查找结束标签
+                  const thinkEndIdx = findRealTag(remaining, THINKING_END_TAG)
+                  if (thinkEndIdx === -1) {
+                    // 没有结束标签，全部是 thinking 内容
+                    thinkingBuffer += remaining
+                    yield { type: 'thinking', thinking: remaining }
+                    remaining = ''
+                  } else {
+                    // 找到结束标签
+                    if (thinkEndIdx > 0) {
+                      const thinkContent = remaining.substring(0, thinkEndIdx)
+                      thinkingBuffer += thinkContent
+                      yield { type: 'thinking', thinking: thinkContent }
+                    }
+                    inThinkingBlock = false
+                    yield { type: 'thinking_end', thinking: thinkingBuffer }
+                    thinkingBuffer = ''
+                    remaining = remaining.substring(thinkEndIdx + THINKING_END_TAG.length)
                   }
                 }
+              }
+            } else {
+              // 未启用 thinking 模式，直接输出
+              yield { type: 'content', content: event.data }
+            }
+          } else if (event.type === 'toolUse') {
+            // 工具调用事件（包含 name 和 toolUseId）
+            const tc = event.data
+            if (tc.name && tc.toolUseId) {
+              // 检查是否是同一个工具调用的续传
+              if (currentToolCall && currentToolCall.toolUseId === tc.toolUseId) {
+                currentToolCall.input += tc.input || ''
               } else {
-                // 未启用 thinking 模式，直接输出
-                yield { type: 'content', content: chunk }
+                // 不同的工具调用，先保存之前的
+                if (currentToolCall) {
+                  yield { type: 'toolUse', toolUse: currentToolCall }
+                }
+                currentToolCall = {
+                  toolUseId: tc.toolUseId,
+                  name: tc.name,
+                  input: tc.input || ''
+                }
+              }
+              // 如果这个事件包含 stop，完成工具调用
+              if (tc.stop) {
+                yield { type: 'toolUse', toolUse: currentToolCall }
+                currentToolCall = null
               }
             }
-          } catch (e) {
-            // JSON 解析失败时，记录错误但继续处理
-            console.warn('[KiroClient] Stream JSON parse failed:', e.message)
+          } else if (event.type === 'toolUseInput') {
+            // 工具调用的 input 续传事件
+            if (currentToolCall) {
+              currentToolCall.input += event.data.input || ''
+            }
+          } else if (event.type === 'toolUseStop') {
+            // 工具调用结束事件
+            if (currentToolCall && event.data.stop) {
+              yield { type: 'toolUse', toolUse: currentToolCall }
+              currentToolCall = null
+            }
+          } else if (event.type === 'contextUsage') {
+            // 上下文使用百分比事件
+            yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage }
           }
-
-          lastProcessedEnd = contentEnd + 2
-          pos = lastProcessedEnd
         }
+      }
 
-        // 保留未处理的部分
-        if (lastProcessedEnd > 0) {
-          buffer = buffer.substring(lastProcessedEnd)
-        }
+      // 处理未完成的工具调用
+      if (currentToolCall) {
+        yield { type: 'toolUse', toolUse: currentToolCall }
+        currentToolCall = null
       }
 
       // 处理流结束时可能残留的内容
       if (thinkingEnabled && contentBuffer.length > 0) {
-        yield { type: 'content', content: contentBuffer };
+        yield { type: 'content', content: contentBuffer }
+      }
+
+      // 检查文本内容中的 bracket 格式工具调用
+      const bracketToolCalls = parseBracketToolCalls(totalContent)
+      if (bracketToolCalls && bracketToolCalls.length > 0) {
+        for (const btc of bracketToolCalls) {
+          let input = {}
+          try {
+            input = JSON.parse(btc.function.arguments || '{}')
+          } catch (e) {
+            // 保持原样
+          }
+          yield {
+            type: 'toolUse',
+            toolUse: {
+              toolUseId: btc.id || `tool_${uuidv4()}`,
+              name: btc.function.name,
+              input
+            }
+          }
+        }
       }
     } finally {
       reader.releaseLock()
     }
+  }
+
+  /**
+   * 解析 AWS Event Stream 格式，提取所有完整的 JSON 事件
+   * 参照 claude-kiro.js 的 parseAwsEventStreamBuffer 实现
+   * @param {string} buffer - 原始缓冲区字符串
+   * @returns {{ events: Array, remaining: string }} 解析出的事件数组和未处理完的缓冲区
+   */
+  parseAwsEventStreamBuffer(buffer) {
+    const events = []
+    let remaining = buffer
+    let searchStart = 0
+    
+    while (true) {
+      // 查找真正的 JSON payload 起始位置
+      // AWS Event Stream 包含二进制头部，我们只搜索有效的 JSON 模式
+      // Kiro 返回格式: {"content":"..."} 或 {"name":"xxx","toolUseId":"xxx",...} 或 {"followupPrompt":"..."}
+      
+      // 搜索所有可能的 JSON payload 开头模式
+      const contentStart = remaining.indexOf('{"content":', searchStart)
+      const nameStart = remaining.indexOf('{"name":', searchStart)
+      const followupStart = remaining.indexOf('{"followupPrompt":', searchStart)
+      const inputStart = remaining.indexOf('{"input":', searchStart)
+      const stopStart = remaining.indexOf('{"stop":', searchStart)
+      const contextUsageStart = remaining.indexOf('{"contextUsagePercentage":', searchStart)
+      
+      // 找到最早出现的有效 JSON 模式
+      const candidates = [contentStart, nameStart, followupStart, inputStart, stopStart, contextUsageStart].filter(pos => pos >= 0)
+      if (candidates.length === 0) break
+      
+      const jsonStart = Math.min(...candidates)
+      if (jsonStart < 0) break
+      
+      // 正确处理嵌套的 {} - 使用括号计数法
+      let braceCount = 0
+      let jsonEnd = -1
+      let inString = false
+      let escapeNext = false
+      
+      for (let i = jsonStart; i < remaining.length; i++) {
+        const char = remaining[i]
+        
+        if (escapeNext) {
+          escapeNext = false
+          continue
+        }
+        
+        if (char === '\\') {
+          escapeNext = true
+          continue
+        }
+        
+        if (char === '"') {
+          inString = !inString
+          continue
+        }
+        
+        if (!inString) {
+          if (char === '{') {
+            braceCount++
+          } else if (char === '}') {
+            braceCount--
+            if (braceCount === 0) {
+              jsonEnd = i
+              break
+            }
+          }
+        }
+      }
+      
+      if (jsonEnd < 0) {
+        // 不完整的 JSON，保留在缓冲区等待更多数据
+        remaining = remaining.substring(jsonStart)
+        break
+      }
+      
+      const jsonStr = remaining.substring(jsonStart, jsonEnd + 1)
+      try {
+        const parsed = JSON.parse(jsonStr)
+        // 处理 content 事件
+        if (parsed.content !== undefined && !parsed.followupPrompt) {
+          events.push({ type: 'content', data: parsed.content })
+        }
+        // 处理结构化工具调用事件 - 开始事件（包含 name 和 toolUseId）
+        else if (parsed.name && parsed.toolUseId) {
+          events.push({
+            type: 'toolUse',
+            data: {
+              name: parsed.name,
+              toolUseId: parsed.toolUseId,
+              input: parsed.input || '',
+              stop: parsed.stop || false
+            }
+          })
+        }
+        // 处理工具调用的 input 续传事件（只有 input 字段）
+        else if (parsed.input !== undefined && !parsed.name) {
+          events.push({
+            type: 'toolUseInput',
+            data: {
+              input: parsed.input
+            }
+          })
+        }
+        // 处理工具调用的结束事件（只有 stop 字段，且不包含 contextUsagePercentage）
+        else if (parsed.stop !== undefined && parsed.contextUsagePercentage === undefined) {
+          events.push({
+            type: 'toolUseStop',
+            data: {
+              stop: parsed.stop
+            }
+          })
+        }
+        // 处理上下文使用百分比事件（最后一条消息）
+        else if (parsed.contextUsagePercentage !== undefined) {
+          events.push({
+            type: 'contextUsage',
+            data: {
+              contextUsagePercentage: parsed.contextUsagePercentage
+            }
+          })
+        }
+      } catch (e) {
+        // JSON 解析失败，跳过这个位置继续搜索
+      }
+      
+      searchStart = jsonEnd + 1
+      if (searchStart >= remaining.length) {
+        remaining = ''
+        break
+      }
+    }
+    
+    // 如果 searchStart 有进展，截取剩余部分
+    if (searchStart > 0 && remaining.length > 0) {
+      remaining = remaining.substring(searchStart)
+    }
+    
+    return { events, remaining }
   }
 
   static getSupportedModels() {
