@@ -302,6 +302,12 @@ async function handleStreamResponse(req, res, options) {
     }
   }))
 
+  // 工具调用相关状态
+  let toolCalls = []
+  let currentToolCall = null
+  let toolCallBlockStarted = false
+  let stopReason = 'end_turn'
+
   try {
     for await (const event of streamResult.stream) {
       if (event.type === 'thinking_start') {
@@ -356,6 +362,56 @@ async function handleStreamResponse(req, res, options) {
           index: contentBlockIndex,
           delta: { type: 'text_delta', text: event.content }
         }))
+      } else if (event.type === 'tool_use') {
+        // 工具调用事件
+        if (timeToFirstByte === null) {
+          timeToFirstByte = Date.now() - startTime
+        }
+
+        // 如果有未关闭的文本块，先关闭它
+        if (textBlockStarted) {
+          res.write(buildSSEEvent('content_block_stop', {
+            type: 'content_block_stop',
+            index: contentBlockIndex
+          }))
+          contentBlockIndex++
+          textBlockStarted = false
+        }
+
+        // 发送 tool_use content_block_start
+        res.write(buildSSEEvent('content_block_start', {
+          type: 'content_block_start',
+          index: contentBlockIndex,
+          content_block: {
+            type: 'tool_use',
+            id: event.id,
+            name: event.name,
+            input: {}
+          }
+        }))
+
+        // 发送 input_json_delta（工具参数）
+        const inputJson = JSON.stringify(event.input || {})
+        res.write(buildSSEEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index: contentBlockIndex,
+          delta: { type: 'input_json_delta', partial_json: inputJson }
+        }))
+
+        // 关闭工具调用块
+        res.write(buildSSEEvent('content_block_stop', {
+          type: 'content_block_stop',
+          index: contentBlockIndex
+        }))
+        contentBlockIndex++
+
+        // 记录工具调用
+        toolCalls.push({
+          id: event.id,
+          name: event.name,
+          input: event.input
+        })
+        stopReason = 'tool_use'
       } else if (event.type === 'token_refreshed' && event.newTokens) {
         const expiresAt = Date.now() + (event.newTokens.expiresIn || 3600) * 1000
         await accountPool.updateAccountToken(
@@ -378,7 +434,7 @@ async function handleStreamResponse(req, res, options) {
 
     res.write(buildSSEEvent('message_delta', {
       type: 'message_delta',
-      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      delta: { stop_reason: stopReason, stop_sequence: null },
       usage: { output_tokens: outputTokens }
     }))
 
