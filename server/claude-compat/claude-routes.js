@@ -11,7 +11,7 @@ import RequestLogger from '../openai-compat/request-logger.js'
 import { validateApiKey } from '../openai-compat/auth-middleware.js'
 import { generateHeaders } from '../utils/header-generator.js'
 import { getClientIp, sanitizeHeaders } from '../utils/request-utils.js'
-import { delay, isRetryableError } from '../utils/retry-utils.js'
+import { isRetryableError, isQuotaExhaustedError } from '../utils/retry-utils.js'
 import {
   estimateTokens,
   estimateInputTokens,
@@ -37,6 +37,9 @@ let accountPool = null
 let requestLogger = null
 let systemLogger = null
 let dbPool = null
+
+// 从环境变量读取最大重试次数，默认5次
+const MAX_ACCOUNT_RETRIES = parseInt(process.env.MAX_ACCOUNT_RETRIES || '5', 10)
 
 /**
  * 初始化路由
@@ -120,7 +123,7 @@ router.post('/v1/messages', validateApiKey, validateAnthropicVersion, async (req
 
   let account = null
   let retryCount = 0
-  const maxRetries = 1
+  const maxRetries = MAX_ACCOUNT_RETRIES // 从环境变量读取，默认5次
 
   try {
     const groupId = req.groupId || null
@@ -223,10 +226,31 @@ async function handleStreamResponse(req, res, options) {
   try {
     streamResult = await executeStreamRequest(currentAccount)
   } catch (error) {
-    if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
+    // 402 错误：配额耗尽，标记账号并尝试切换账号重试
+    if (isQuotaExhaustedError(error)) {
+      console.log(`[Claude API] Quota exhausted (402) for account ${currentAccount.email}, marking and switching...`)
+      accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
+      
+      // 尝试切换账号重试
+      if (retryCount < maxRetries && !account_id) {
+        retryCount++
+        
+        const newAccount = await accountPool.getNextAccount(groupId)
+        if (newAccount && newAccount.id !== currentAccount.id) {
+          console.log(`[Claude API] Retry stream with new account after 402: ${newAccount.email}`)
+          await accountPool.incrementApiCall(newAccount.id)
+          currentAccount = newAccount
+          streamResult = await executeStreamRequest(currentAccount)
+        } else {
+          throw error // 没有其他可用账号
+        }
+      } else {
+        throw error
+      }
+    } else if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
       await accountPool.markAccountError(currentAccount.id)
       retryCount++
-      await delay(1000)
+      
       const newAccount = await accountPool.getNextAccount(groupId)
       if (newAccount && newAccount.id !== currentAccount.id) {
         await accountPool.incrementApiCall(newAccount.id)
@@ -375,10 +399,167 @@ async function handleStreamResponse(req, res, options) {
     })
   } catch (error) {
     console.error('[Claude API] Stream error:', error.message)
-    if (isRetryableError(error)) {
+
+    // 检查是否为 TOKEN_EXPIRED 错误且未指定账号 ID（允许切换账号）
+    if (error.message === 'TOKEN_EXPIRED' && !account_id && retryCount < maxRetries) {
+      console.log(`[Claude API] TOKEN_EXPIRED during stream, attempting account switch... (${retryCount + 1}/${maxRetries})`)
+
+      await accountPool.markAccountError(currentAccount.id)
+      retryCount++
+
+      try {
+        // 获取新账号
+        
+        const newAccount = await accountPool.getNextAccount(groupId)
+
+        if (newAccount && newAccount.id !== currentAccount.id) {
+          console.log(`[Claude API] Switching to new account: ${newAccount.email}`)
+          await accountPool.incrementApiCall(newAccount.id)
+
+          // 使用新账号重新开始流式请求
+          const newClient = new KiroClient(newAccount, systemLogger)
+          const newStream = newClient.streamApi(convertedMessages, model, {
+            system: systemPrompt,
+            tools: convertedTools,
+            requestBody
+          })
+
+          currentAccount = newAccount
+          fullContent = ''
+          thinkingContent = ''
+          let retryContentBlockIndex = 0
+          let retryThinkingBlockStarted = false
+          let retryTextBlockStarted = false
+          let retryTimeToFirstByte = null
+          const retryStartTime = Date.now()
+
+          // 重新处理新流
+          for await (const event of newStream) {
+            if (event.type === 'thinking_start') {
+              if (retryTimeToFirstByte === null) {
+                retryTimeToFirstByte = Date.now() - retryStartTime
+              }
+              if (!retryThinkingBlockStarted) {
+                res.write(buildSSEEvent('content_block_start', {
+                  type: 'content_block_start',
+                  index: retryContentBlockIndex,
+                  content_block: { type: 'thinking', thinking: '' }
+                }))
+                retryThinkingBlockStarted = true
+              }
+            } else if (event.type === 'thinking' && event.thinking) {
+              if (retryTimeToFirstByte === null) {
+                retryTimeToFirstByte = Date.now() - retryStartTime
+              }
+              thinkingContent += event.thinking
+              res.write(buildSSEEvent('content_block_delta', {
+                type: 'content_block_delta',
+                index: retryContentBlockIndex,
+                delta: { type: 'thinking_delta', thinking: event.thinking }
+              }))
+            } else if (event.type === 'thinking_end') {
+              if (retryThinkingBlockStarted) {
+                res.write(buildSSEEvent('content_block_stop', {
+                  type: 'content_block_stop',
+                  index: retryContentBlockIndex
+                }))
+                retryContentBlockIndex++
+                retryThinkingBlockStarted = false
+              }
+            } else if (event.type === 'content' && event.content) {
+              if (retryTimeToFirstByte === null) {
+                retryTimeToFirstByte = Date.now() - retryStartTime
+              }
+              if (!retryTextBlockStarted) {
+                res.write(buildSSEEvent('content_block_start', {
+                  type: 'content_block_start',
+                  index: retryContentBlockIndex,
+                  content_block: { type: 'text', text: '' }
+                }))
+                retryTextBlockStarted = true
+              }
+              fullContent += event.content
+              res.write(buildSSEEvent('content_block_delta', {
+                type: 'content_block_delta',
+                index: retryContentBlockIndex,
+                delta: { type: 'text_delta', text: event.content }
+              }))
+            } else if (event.type === 'token_refreshed' && event.newTokens) {
+              const expiresAt = Date.now() + (event.newTokens.expiresIn || 3600) * 1000
+              await accountPool.updateAccountToken(
+                currentAccount.id,
+                event.newTokens.accessToken,
+                event.newTokens.refreshToken,
+                expiresAt
+              )
+              console.log(`[Claude API] Stream token refreshed for ${currentAccount.email} (after switch)`)
+            }
+          }
+
+          if (retryTextBlockStarted) {
+            res.write(buildSSEEvent('content_block_stop', {
+              type: 'content_block_stop',
+              index: retryContentBlockIndex
+            }))
+          }
+
+          outputTokens = estimateTokens(fullContent) + estimateTokens(thinkingContent)
+
+          res.write(buildSSEEvent('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn', stop_sequence: null },
+            usage: { output_tokens: outputTokens }
+          }))
+
+          res.write(buildSSEEvent('message_stop', { type: 'message_stop' }))
+
+          accountPool.markAccountSuccess(currentAccount.id)
+
+          requestLogger.logSuccess({
+            requestId,
+            accountId: currentAccount.id,
+            accountEmail: currentAccount.email,
+            accountIdp: currentAccount.idp,
+            model,
+            isStream: true,
+            requestTokens: inputTokens,
+            responseTokens: outputTokens,
+            durationMs: Date.now() - startTime,
+            timeToFirstByte: retryTimeToFirstByte,
+            clientIp,
+            userAgent,
+            isThinking,
+            thinkingBudget,
+            headerVersion: currentAccount.headerVersion || 1,
+            requestHeaders: kiroHeaders,
+            apiProtocol: 'claude'
+          })
+
+          console.log(`[Claude API] Successfully recovered from TOKEN_EXPIRED by switching accounts`)
+          res.end()
+          return
+        }
+      } catch (retryError) {
+        console.error('[Claude API] Account switch failed:', retryError.message)
+      }
+    }
+
+    // 检查是否为 402 配额耗尽错误
+    if (isQuotaExhaustedError(error)) {
+      // 402 错误：异步更新使用量，不重试（次月1日才会恢复额度）
+      accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
+    } else if (isRetryableError(error)) {
       await accountPool.markAccountError(currentAccount.id)
     }
-    
+
+    // 确定错误类型
+    let errorType = 'stream_error'
+    if (isQuotaExhaustedError(error)) {
+      errorType = 'quota_exhausted'
+    } else if (isRetryableError(error)) {
+      errorType = 'token_expired'
+    }
+
     // 记录错误日志
     requestLogger.logError({
       requestId,
@@ -387,7 +568,7 @@ async function handleStreamResponse(req, res, options) {
       accountIdp: currentAccount.idp,
       model,
       isStream: true,
-      errorType: isRetryableError(error) ? 'token_expired' : 'stream_error',
+      errorType,
       errorMessage: error.message,
       requestTokens: inputTokens,
       responseTokens: estimateTokens(fullContent),
@@ -401,10 +582,10 @@ async function handleStreamResponse(req, res, options) {
       requestHeaders: kiroHeaders,
       apiProtocol: 'claude'
     })
-    
+
     res.write(buildSSEEvent('error', {
       type: 'error',
-      error: { type: 'api_error', message: error.message }
+      error: { type: isQuotaExhaustedError(error) ? 'quota_exhausted' : 'api_error', message: error.message }
     }))
   }
 
@@ -447,10 +628,31 @@ async function handleNonStreamResponse(req, res, options) {
     try {
       result = await executeRequest(currentAccount)
     } catch (error) {
-      if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
+      // 402 错误：配额耗尽，标记账号并尝试切换账号重试
+      if (isQuotaExhaustedError(error)) {
+        console.log(`[Claude API] Quota exhausted (402) for account ${currentAccount.email}, marking and switching...`)
+        accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
+        
+        // 尝试切换账号重试
+        if (retryCount < maxRetries && !account_id) {
+          retryCount++
+          
+          const newAccount = await accountPool.getNextAccount(groupId)
+          if (newAccount && newAccount.id !== currentAccount.id) {
+            console.log(`[Claude API] Retry with new account after 402: ${newAccount.email}`)
+            await accountPool.incrementApiCall(newAccount.id)
+            result = await executeRequest(newAccount)
+            currentAccount = newAccount
+          } else {
+            throw error // 没有其他可用账号
+          }
+        } else {
+          throw error
+        }
+      } else if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
         await accountPool.markAccountError(currentAccount.id)
         retryCount++
-        await delay(1000)
+        
         const newAccount = await accountPool.getNextAccount(groupId)
         if (newAccount && newAccount.id !== currentAccount.id) {
           await accountPool.incrementApiCall(newAccount.id)
@@ -498,10 +700,19 @@ async function handleNonStreamResponse(req, res, options) {
     res.json(response)
   } catch (error) {
     console.error('[Claude API] Error:', error.message)
-    if (isRetryableError(error)) {
+    
+    // 检查是否为 402 配额耗尽错误
+    if (isQuotaExhaustedError(error)) {
+      // 402 错误：异步更新使用量，不重试（次月1日才会恢复额度）
+      accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
+    } else if (isRetryableError(error)) {
       await accountPool.markAccountError(currentAccount.id)
     }
-    const err = buildClaudeError('api_error', error.message, 500)
+    
+    // 402 错误返回 402 状态码
+    const statusCode = isQuotaExhaustedError(error) ? 402 : 500
+    const errorType = isQuotaExhaustedError(error) ? 'quota_exhausted' : 'api_error'
+    const err = buildClaudeError(errorType, error.message, statusCode)
     res.status(err.status).json(err.body)
   }
 }

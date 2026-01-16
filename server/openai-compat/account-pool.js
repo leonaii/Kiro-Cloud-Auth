@@ -192,6 +192,95 @@ class AccountPool {
    * 初始化活跃池
    * 从数据库加载账号并填充活跃池
    */
+  /**
+   * 计算账号的资源包过期优先级
+   * 返回值越小优先级越高
+   *
+   * 优先级规则：
+   * 1. 资源包已过期的账号（按添加时间最早的优先）
+   * 2. 资源包快过期的账号（按添加时间最早的优先）
+   * 3. 其他账号（按添加时间最早的优先）
+   *
+   * 额外考虑：剩余配额 (usage_limit - usage_current)
+   * - 剩余配额 <= 5 的账号会被降低优先级（但查询时已过滤，这里作为额外保护）
+   * - 剩余配额越少，优先级越低（在同等过期优先级下）
+   *
+   * @param {object} account - 账号对象
+   * @returns {object} { priority: number, createdAt: number, expiresAt: number|null, remainingQuota: number }
+   */
+  calculateAccountPriority(account) {
+    const now = Date.now()
+    const createdAt = account.createdAt || now
+    
+    // 计算剩余配额
+    const usageLimit = account.usage?.limit || 0
+    const usageCurrent = account.usage?.current || 0
+    const remainingQuota = usageLimit - usageCurrent
+    
+    // 获取最早的资源包过期时间
+    let earliestExpiry = null
+    
+    // 检查 subscription.expiresAt (sub_expires_at 存储的是天数，需要转换)
+    // 注意：sub_expires_at 存储的是天数，不是时间戳
+    // 如果 sub_expires_at 是一个较小的数字（如 30），说明是天数
+    // 如果是一个较大的数字（如 1700000000000），说明是时间戳
+    if (account.subscription?.expiresAt) {
+      const subExpiry = account.subscription.expiresAt
+      // 判断是天数还是时间戳：如果小于 100000，认为是天数
+      if (subExpiry < 100000) {
+        // 天数：从当前日期开始计算
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        earliestExpiry = today.getTime() + subExpiry * 24 * 60 * 60 * 1000
+      } else {
+        earliestExpiry = subExpiry
+      }
+    }
+    
+    // 检查 usage.freeTrialExpiry
+    if (account.usage?.freeTrialExpiry) {
+      const trialExpiry = account.usage.freeTrialExpiry
+      if (!earliestExpiry || trialExpiry < earliestExpiry) {
+        earliestExpiry = trialExpiry
+      }
+    }
+    
+    // 检查 usage.bonuses 中的过期时间
+    if (account.usage?.bonuses && Array.isArray(account.usage.bonuses)) {
+      for (const bonus of account.usage.bonuses) {
+        if (bonus.expiresAt) {
+          if (!earliestExpiry || bonus.expiresAt < earliestExpiry) {
+            earliestExpiry = bonus.expiresAt
+          }
+        }
+      }
+    }
+    
+    // 计算优先级
+    let priority
+    
+    // 首先检查剩余配额：如果 <= 5，设为最低优先级（作为额外保护，查询时已过滤）
+    if (remainingQuota <= 5) {
+      priority = 4  // 最低优先级
+    } else if (!earliestExpiry) {
+      // 没有过期时间信息，较低优先级
+      priority = 3
+    } else if (earliestExpiry <= now) {
+      // 已过期，最高优先级（优先消耗即将失效的配额）
+      priority = 1
+    } else {
+      // 未过期，中等优先级（越快过期优先级越高）
+      priority = 2
+    }
+    
+    return {
+      priority,
+      createdAt,
+      expiresAt: earliestExpiry,
+      remainingQuota
+    }
+  }
+
   async initializeActivePool() {
     if (!this.activePoolConfig.enabled) {
       return
@@ -213,19 +302,48 @@ class AccountPool {
       this.activePool.clear()
       this.coolingPool.clear()
 
-      // 按使用率排序，选择使用率最低的账号加入活跃池
-      const sortedAccounts = [...accounts].sort((a, b) => a.usage.percentUsed - b.usage.percentUsed)
+      // 新排序逻辑：
+      // 1. 优先使用资源包已过期的账号（按添加时间最早的优先）
+      // 2. 其次使用资源包快过期的账号（按添加时间最早的优先）
+      // 3. 无过期信息的账号（按添加时间最早的优先）
+      // 4. 剩余配额 <= 5 的账号（最低优先级，作为额外保护）
+      const sortedAccounts = [...accounts].sort((a, b) => {
+        const priorityA = this.calculateAccountPriority(a)
+        const priorityB = this.calculateAccountPriority(b)
+        
+        // 首先按优先级排序（1=已过期, 2=未过期, 3=无过期信息, 4=配额不足）
+        if (priorityA.priority !== priorityB.priority) {
+          return priorityA.priority - priorityB.priority
+        }
+        
+        // 同优先级时，按过期时间排序（越早过期越优先）
+        if (priorityA.priority === 2 && priorityB.priority === 2) {
+          if (priorityA.expiresAt !== priorityB.expiresAt) {
+            return priorityA.expiresAt - priorityB.expiresAt
+          }
+        }
+        
+        // 同优先级时，按剩余配额排序（配额少的优先，尽快用完即将过期的配额）
+        if (priorityA.remainingQuota !== priorityB.remainingQuota) {
+          return priorityA.remainingQuota - priorityB.remainingQuota
+        }
+        
+        // 最后按添加时间排序（越早添加越优先）
+        return priorityA.createdAt - priorityB.createdAt
+      })
 
       // 填充活跃池（最多 limit 个）
       const limit = Math.min(this.activePoolConfig.limit, sortedAccounts.length)
       for (let i = 0; i < limit; i++) {
         const account = sortedAccounts[i]
+        const priority = this.calculateAccountPriority(account)
         this.activePool.set(account.id, {
           account,
           addedAt: Date.now(),
           errorCount: 0,
           lastErrorAt: null
         })
+        console.log(`[AccountPool] Added to active pool: ${account.email} (priority: ${priority.priority}, expires: ${priority.expiresAt ? new Date(priority.expiresAt).toISOString() : 'N/A'}, quota: ${priority.remainingQuota}, created: ${new Date(priority.createdAt).toISOString()})`)
       }
 
       this.activePoolInitialized = true
@@ -240,11 +358,18 @@ class AccountPool {
             activePoolSize: this.activePool.size,
             limit: this.activePoolConfig.limit,
             totalAvailable: accounts.length,
-            accounts: Array.from(this.activePool.values()).map(p => ({
-              id: p.account.id,
-              email: p.account.email,
-              usagePercent: p.account.usage.percentUsed
-            }))
+            accounts: Array.from(this.activePool.values()).map(p => {
+              const priority = this.calculateAccountPriority(p.account)
+              return {
+                id: p.account.id,
+                email: p.account.email,
+                usagePercent: p.account.usage.percentUsed,
+                priority: priority.priority,
+                expiresAt: priority.expiresAt,
+                createdAt: priority.createdAt,
+                remainingQuota: priority.remainingQuota
+              }
+            })
           },
           level: 'info'
         }).catch(() => {})
@@ -312,6 +437,9 @@ class AccountPool {
           accountsToRemove.push({ accountId, reason: 'banned', lastError: row.last_error })
         } else if (row.status === 'error') {
           accountsToRemove.push({ accountId, reason: 'error', lastError: row.last_error })
+        } else if (row.status === 'quota_exhausted') {
+          // 402 配额耗尽的账号，直接移除（不进入冷却池，次月1日才恢复）
+          accountsToRemove.push({ accountId, reason: 'quota_exhausted', lastError: row.last_error })
         }
       } catch (error) {
         console.error(`[AccountPool] Failed to check health for account ${accountId}:`, error.message)
@@ -376,8 +504,12 @@ class AccountPool {
   }
 
   /**
-   * 补充活跃池（进位法原则）
-   * 当活跃池未满时，从可用账号中选择使用率最低的账号加入
+   * 补充活跃池
+   * 当活跃池未满时，按优先级选择账号加入：
+   * 1. 优先使用资源包已过期的账号（按添加时间最早的优先）
+   * 2. 其次使用资源包快过期的账号（按添加时间最早的优先）
+   * 3. 无过期信息的账号（按添加时间最早的优先）
+   * 4. 剩余配额 <= 5 的账号（最低优先级，作为额外保护）
    */
   async replenishActivePool() {
     if (this.activePool.size >= this.activePoolConfig.limit) {
@@ -399,13 +531,37 @@ class AccountPool {
         return
       }
 
-      // 按使用率排序（进位法：选择使用率最低的）
-      const sortedAccounts = [...availableAccounts].sort((a, b) => a.usage.percentUsed - b.usage.percentUsed)
+      // 使用新的优先级排序逻辑
+      const sortedAccounts = [...availableAccounts].sort((a, b) => {
+        const priorityA = this.calculateAccountPriority(a)
+        const priorityB = this.calculateAccountPriority(b)
+        
+        // 首先按优先级排序（1=已过期, 2=未过期, 3=无过期信息, 4=配额不足）
+        if (priorityA.priority !== priorityB.priority) {
+          return priorityA.priority - priorityB.priority
+        }
+        
+        // 同优先级时，按过期时间排序（越早过期越优先）
+        if (priorityA.priority === 2 && priorityB.priority === 2) {
+          if (priorityA.expiresAt !== priorityB.expiresAt) {
+            return priorityA.expiresAt - priorityB.expiresAt
+          }
+        }
+        
+        // 同优先级时，按剩余配额排序（配额少的优先，尽快用完即将过期的配额）
+        if (priorityA.remainingQuota !== priorityB.remainingQuota) {
+          return priorityA.remainingQuota - priorityB.remainingQuota
+        }
+        
+        // 最后按添加时间排序（越早添加越优先）
+        return priorityA.createdAt - priorityB.createdAt
+      })
 
       // 添加到活跃池
       const toAdd = Math.min(needed, sortedAccounts.length)
       for (let i = 0; i < toAdd; i++) {
         const account = sortedAccounts[i]
+        const priority = this.calculateAccountPriority(account)
         this.activePool.set(account.id, {
           account,
           addedAt: Date.now(),
@@ -414,7 +570,7 @@ class AccountPool {
         })
         this.stats.activePoolPromotions++
 
-        console.log(`[AccountPool] Promoted account ${account.email} to active pool (usage: ${account.usage.percentUsed.toFixed(1)}%)`)
+        console.log(`[AccountPool] Promoted account ${account.email} to active pool (priority: ${priority.priority}, expires: ${priority.expiresAt ? new Date(priority.expiresAt).toISOString() : 'N/A'}, quota: ${priority.remainingQuota})`)
 
         if (this.systemLogger) {
           await this.systemLogger.logAccountPool({
@@ -424,6 +580,9 @@ class AccountPool {
               accountId: account.id,
               email: account.email,
               usagePercent: account.usage.percentUsed,
+              priority: priority.priority,
+              expiresAt: priority.expiresAt,
+              remainingQuota: priority.remainingQuota,
               activePoolSize: this.activePool.size
             },
             level: 'info'
@@ -1141,6 +1300,9 @@ class AccountPool {
                cred_client_secret, cred_region, cred_expires_at,
                cred_auth_method, cred_provider,
                usage_current, usage_limit, usage_percent_used,
+               usage_base_current, usage_base_limit,
+               usage_free_trial_expiry, usage_bonuses,
+               sub_expires_at, created_at,
                api_call_count, api_last_call_at, api_total_tokens, last_error,
                header_version, amz_invocation_id, kiro_device_hash,
                sdk_js_version, ide_version
@@ -1657,6 +1819,58 @@ class AccountPool {
   markAccountSuccess(accountId) {
     if (this.activePoolConfig.enabled) {
       this.resetActivePoolErrorCount(accountId)
+    }
+  }
+
+  /**
+   * 标记账号配额耗尽（402 错误）
+   * 异步更新使用量，不重试（次月1日才会恢复额度）
+   * @param {string} accountId - 账号 ID
+   * @param {string} errorMessage - 错误消息
+   */
+  async markAccountQuotaExhausted(accountId, errorMessage = 'Quota exhausted (402)') {
+    console.log(`[AccountPool] Account ${accountId} quota exhausted (402), marking as exhausted`)
+    
+    // 异步更新数据库（不等待，不阻塞请求）
+    this.dbPool
+      .query(
+        `UPDATE accounts
+         SET usage_current = usage_limit,
+             usage_percent_used = 100,
+             usage_base_current = usage_base_limit,
+             last_error = ?,
+             status = 'quota_exhausted'
+         WHERE id = ?`,
+        [errorMessage, accountId]
+      )
+      .then(() => {
+        console.log(`[AccountPool] Account ${accountId} marked as quota_exhausted in database`)
+      })
+      .catch((error) => {
+        console.error(`[AccountPool] Failed to mark account ${accountId} as quota_exhausted:`, error.message)
+        this.stats.dbErrors++
+      })
+
+    // 从活跃池移除（如果在活跃池中）
+    if (this.activePoolConfig.enabled && this.activePool.has(accountId)) {
+      this.activePool.delete(accountId)
+      console.log(`[AccountPool] Account ${accountId} removed from active pool due to quota exhaustion`)
+      
+      // 尝试补充活跃池
+      this.replenishActivePool().catch(() => {})
+    }
+
+    // 清除缓存
+    this.invalidateCache()
+
+    // 记录日志
+    if (this.systemLogger) {
+      this.systemLogger.logAccountPool({
+        action: 'quota_exhausted',
+        message: `账号 ${accountId} 配额耗尽 (402)，次月1日恢复`,
+        details: { accountId, errorMessage },
+        level: 'warn'
+      }).catch(() => {})
     }
   }
 

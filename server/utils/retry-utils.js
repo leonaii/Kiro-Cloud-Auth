@@ -25,3 +25,14 @@ export function isRetryableError(error) {
     msg.includes('unauthorized')
   )
 }
+
+/**
+ * 判断是否为配额耗尽错误 (402)
+ * 402 错误表示账号配额已用完，次月1日才会恢复，不应重试
+ * @param {Error} error - 错误对象
+ * @returns {boolean}
+ */
+export function isQuotaExhaustedError(error) {
+  const msg = error.message || ''
+  return msg.includes('402') || msg.includes('quota') || msg.includes('Payment Required')
+}

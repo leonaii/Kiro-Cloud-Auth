@@ -10,7 +10,7 @@ import AccountPool from './account-pool.js'
 import RequestLogger from './request-logger.js'
 import { validateApiKey } from './auth-middleware.js'
 import { getClientIp } from '../utils/request-utils.js'
-import { delay, isRetryableError } from '../utils/retry-utils.js'
+import { isRetryableError, isQuotaExhaustedError } from '../utils/retry-utils.js'
 import { convertMessages, extractSystemPrompt, estimateTokens } from './openai-converter.js'
 import { buildOpenAIResponse, buildStreamChunk, buildToolCallChunk } from './openai-response.js'
 
@@ -19,6 +19,9 @@ let accountPool = null
 let requestLogger = null
 let systemLogger = null
 let dbPool = null
+
+// 从环境变量读取最大重试次数，默认5次
+const MAX_ACCOUNT_RETRIES = parseInt(process.env.MAX_ACCOUNT_RETRIES || '5', 10)
 
 /**
  * 初始化路由
@@ -108,7 +111,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
   let account = null
   let retryCount = 0
-  const maxRetries = 1 // 最多重试 1 次
+  const maxRetries = MAX_ACCOUNT_RETRIES // 从环境变量读取，默认5次
 
   try {
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -267,13 +270,34 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       try {
         streamResult = await executeStreamRequest(currentAccount)
       } catch (error) {
-        if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
+        // 402 错误：配额耗尽，标记账号并尝试切换账号重试
+        if (isQuotaExhaustedError(error)) {
+          console.log(`[OpenAI API] Quota exhausted (402) for account ${currentAccount.email}, marking and switching...`)
+          accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
+          
+          // 尝试切换账号重试
+          if (retryCount < maxRetries && !account_id) {
+            retryCount++
+            
+            const newAccount = await accountPool.getNextAccount(groupId)
+            if (newAccount && newAccount.id !== currentAccount.id) {
+              console.log(`[OpenAI API] Retry stream with new account after 402: ${newAccount.email}`)
+              await accountPool.incrementApiCall(newAccount.id)
+              currentAccount = newAccount
+              streamResult = await executeStreamRequest(currentAccount)
+            } else {
+              throw error // 没有其他可用账号
+            }
+          } else {
+            throw error
+          }
+        } else if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
           console.log(
-            `[OpenAI API] Stream init error: ${error.message}, retrying in 1s... (${retryCount + 1}/${maxRetries})`
+            `[OpenAI API] Stream init error: ${error.message}, retrying... (${retryCount + 1}/${maxRetries})`
           )
           await accountPool.markAccountError(currentAccount.id)
           retryCount++
-          await delay(1000)
+          
 
           const newAccount = await accountPool.getNextAccount(groupId)
           if (newAccount && newAccount.id !== currentAccount.id) {
@@ -389,8 +413,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           retryCount++
 
           try {
-            // 等待 1 秒后获取新账号
-            await delay(1000)
+            // 获取新账号
+            
             const newAccount = await accountPool.getNextAccount(groupId)
 
             if (newAccount && newAccount.id !== currentAccount.id) {
@@ -477,8 +501,20 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         }
 
         if (hasError) {
-          if (isRetryableError(error)) {
+          // 检查是否为 402 配额耗尽错误
+          if (isQuotaExhaustedError(error)) {
+            // 402 错误：异步更新使用量，不重试（次月1日才会恢复额度）
+            accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
+          } else if (isRetryableError(error)) {
             await accountPool.markAccountError(currentAccount.id)
+          }
+
+          // 确定错误类型
+          let errorType = 'stream_error'
+          if (isQuotaExhaustedError(error)) {
+            errorType = 'quota_exhausted'
+          } else if (isRetryableError(error)) {
+            errorType = 'token_expired'
           }
 
           requestLogger.logError({
@@ -488,7 +524,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             accountIdp: currentAccount.idp,
             model,
             isStream: true,
-            errorType: isRetryableError(error) ? 'token_expired' : 'stream_error',
+            errorType,
             errorMessage: error.message,
             requestTokens: inputTokens,
             responseTokens: estimateTokens(fullContent),
@@ -538,16 +574,36 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         try {
           result = await executeNonStreamRequest(account)
         } catch (error) {
-          // 检查是否可重试
-          if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
+          // 402 错误：配额耗尽，标记账号并尝试切换账号重试
+          if (isQuotaExhaustedError(error)) {
+            console.log(`[OpenAI API] Quota exhausted (402) for account ${account.email}, marking and switching...`)
+            accountPool.markAccountQuotaExhausted(account.id, error.message)
+            
+            // 尝试切换账号重试
+            if (retryCount < maxRetries && !account_id) {
+              retryCount++
+              
+              const newAccount = await accountPool.getNextAccount(groupId)
+              if (newAccount && newAccount.id !== account.id) {
+                console.log(`[OpenAI API] Retry with new account after 402: ${newAccount.email}`)
+                await accountPool.incrementApiCall(newAccount.id)
+                result = await executeNonStreamRequest(newAccount, true)
+                account = newAccount
+              } else {
+                throw error // 没有其他可用账号
+              }
+            } else {
+              throw error
+            }
+          } else if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
             console.log(
-              `[OpenAI API] Retryable error: ${error.message}, retrying in 1s... (${retryCount + 1}/${maxRetries})`
+              `[OpenAI API] Retryable error: ${error.message}, retrying... (${retryCount + 1}/${maxRetries})`
             )
             await accountPool.markAccountError(account.id)
             retryCount++
 
-            // 等待 1 秒
-            await delay(1000)
+            // 获取新账号重试
+            
 
             // 获取新账号重试
             const newAccount = await accountPool.getNextAccount(groupId)
@@ -596,8 +652,20 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       } catch (error) {
         console.error('[OpenAI API] Error:', error.message)
 
-        if (isRetryableError(error)) {
+        // 检查是否为 402 配额耗尽错误
+        if (isQuotaExhaustedError(error)) {
+          // 402 错误：异步更新使用量，不重试（次月1日才会恢复额度）
+          accountPool.markAccountQuotaExhausted(account.id, error.message)
+        } else if (isRetryableError(error)) {
           await accountPool.markAccountError(account.id)
+        }
+
+        // 确定错误类型
+        let errorType = 'api_error'
+        if (isQuotaExhaustedError(error)) {
+          errorType = 'quota_exhausted'
+        } else if (error.message.includes('403')) {
+          errorType = 'forbidden'
         }
 
         requestLogger.logError({
@@ -607,7 +675,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           accountIdp: account.idp,
           model,
           isStream: false,
-          errorType: error.message.includes('403') ? 'forbidden' : 'api_error',
+          errorType,
           errorMessage: error.message,
           requestTokens: inputTokens,
           durationMs: Date.now() - startTime,
@@ -619,11 +687,13 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           requestHeaders: kiroHeaders
         })
 
-        res.status(500).json({
+        // 402 错误返回 402 状态码
+        const statusCode = isQuotaExhaustedError(error) ? 402 : 500
+        res.status(statusCode).json({
           error: {
             message: error.message,
-            type: 'api_error',
-            code: 'internal_error'
+            type: isQuotaExhaustedError(error) ? 'quota_exhausted' : 'api_error',
+            code: isQuotaExhaustedError(error) ? 'quota_exhausted' : 'internal_error'
           }
         })
       }
