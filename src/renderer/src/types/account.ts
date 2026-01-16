@@ -165,6 +165,16 @@ export interface AccountGroup {
 }
 
 /**
+ * 账号池状态类型
+ */
+export type PoolStatus = 'active' | 'cooling' | 'none'
+
+/**
+ * 未分组特殊标识
+ */
+export const UNGROUPED_ID = '__ungrouped__'
+
+/**
  * 筛选条件
  */
 export interface AccountFilter {
@@ -172,13 +182,14 @@ export interface AccountFilter {
   subscriptionTypes?: SubscriptionType[]
   statuses?: AccountStatus[]
   idps?: IdpType[]
-  groupIds?: string[]
+  groupIds?: string[] // 包含 UNGROUPED_ID 表示筛选未分组账号
   tagIds?: string[]
   usageMin?: number // 使用量百分比
   usageMax?: number
   daysRemainingMin?: number
   daysRemainingMax?: number
   showDeleted?: boolean // 是否显示已删除账号
+  poolStatuses?: PoolStatus[] // 账号池状态筛选
 }
 
 /**

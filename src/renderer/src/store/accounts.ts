@@ -1445,7 +1445,21 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
 
     if (filter.groupIds?.length) {
-      result = result.filter((a) => a.groupId && filter.groupIds!.includes(a.groupId))
+      // 支持未分组筛选：使用特殊标识 '__ungrouped__'
+      const hasUngrouped = filter.groupIds.includes('__ungrouped__')
+      const otherGroupIds = filter.groupIds.filter(id => id !== '__ungrouped__')
+      
+      result = result.filter((a) => {
+        // 如果选中了未分组，且账号没有分组
+        if (hasUngrouped && !a.groupId) {
+          return true
+        }
+        // 如果账号有分组，且分组在筛选列表中
+        if (a.groupId && otherGroupIds.includes(a.groupId)) {
+          return true
+        }
+        return false
+      })
     }
 
     if (filter.tagIds?.length) {

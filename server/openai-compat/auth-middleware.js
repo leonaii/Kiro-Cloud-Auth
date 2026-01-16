@@ -60,11 +60,13 @@ export function clearGroupApiKeyCache() {
 
 /**
  * 验证 API Key 中间件
- * 检查请求的 Authorization header 是否包含有效的 Bearer token
+ * 检查请求的 Authorization header 或 x-api-key header 是否包含有效的 token
  *
  * 认证优先级：
  * 1. JWT Cookie 认证（Web 和 Electron 统一使用）
- * 2. API Key 认证（Bearer token）
+ * 2. API Key 认证
+ *   - Authorization: Bearer <token>（OpenAI 格式）
+ *   - x-api-key: <token>（Claude 格式）
  *   - 默认 SK（访问所有账号）
  *   - 分组 SK（只访问分组内账号）
  */
@@ -90,32 +92,42 @@ export function validateApiKey(req, res, next) {
     return next()
   }
 
+  // 提取 API Key - 支持两种格式：
+  // 1. Authorization: Bearer <token>（OpenAI 格式）
+  // 2. x-api-key: <token>（Claude 格式）
+  let providedKey = null
   const authHeader = req.headers.authorization
+  const xApiKey = req.headers['x-api-key']
 
-  // 检查是否提供了 Authorization header
-  if (!authHeader) {
+  if (authHeader) {
+    // 检查格式是否为 "Bearer <token>"
+    const parts = authHeader.split(' ')
+    if (parts.length === 2 && parts[0] === 'Bearer') {
+      providedKey = parts[1]
+    } else {
+      return res.status(401).json({
+        error: {
+          message: 'Invalid Authorization header format. Expected: Bearer <token>',
+          type: 'authentication_error',
+          code: 'invalid_authorization_format'
+        }
+      })
+    }
+  } else if (xApiKey) {
+    // Claude 格式：x-api-key header
+    providedKey = xApiKey
+  }
+
+  // 检查是否提供了 API Key
+  if (!providedKey) {
     return res.status(401).json({
       error: {
-        message: 'Missing Authorization header',
+        message: 'Missing Authorization header or x-api-key header',
         type: 'authentication_error',
         code: 'missing_authorization'
       }
     })
   }
-
-  // 检查格式是否为 "Bearer <token>"
-  const parts = authHeader.split(' ')
-  if (parts.length !== 2 || parts[0] !== 'Bearer') {
-    return res.status(401).json({
-      error: {
-        message: 'Invalid Authorization header format. Expected: Bearer <token>',
-        type: 'authentication_error',
-        code: 'invalid_authorization_format'
-      }
-    })
-  }
-
-  const providedKey = parts[1]
 
   // 验证 API Key 是否匹配默认 SK
   if (providedKey === DEFAULT_API_KEY) {

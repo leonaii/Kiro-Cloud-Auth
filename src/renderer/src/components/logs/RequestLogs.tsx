@@ -44,6 +44,7 @@ interface LogEntry {
   server_id: string | null
   header_version: number | null
   request_headers: Record<string, string> | null
+  api_protocol: 'openai' | 'claude' | null
   created_at: string
 }
 
@@ -423,6 +424,11 @@ function StatCard({ icon, label, value, loading, color }: { icon: React.ReactNod
   )
 }
 
+const PROTOCOL_COLORS: Record<string, string> = {
+  'openai': 'bg-emerald-500',
+  'claude': 'bg-amber-500'
+}
+
 function LogItem({ log, onClick, formatTime, formatDuration }: { log: LogEntry; onClick: () => void; formatTime: (s: string) => string; formatDuration: (ms: number) => string }) {
   return (
     <div className={cn('p-3 md:p-4 rounded-lg border bg-card hover:bg-muted/30 cursor-pointer transition-colors', log.status === 'error' && 'border-rose-200 dark:border-rose-900/50')} onClick={onClick}>
@@ -432,6 +438,7 @@ function LogItem({ log, onClick, formatTime, formatDuration }: { log: LogEntry; 
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 md:gap-2 flex-wrap">
+            {log.api_protocol && <span className={cn('px-1.5 py-0.5 text-xs rounded text-white font-medium', PROTOCOL_COLORS[log.api_protocol] || 'bg-gray-500')}>{log.api_protocol === 'openai' ? 'OpenAI' : 'Claude'}</span>}
             {log.account_idp && <span className={cn('px-1.5 py-0.5 text-xs rounded text-white', IDP_COLORS[log.account_idp] || 'bg-gray-500')}>{log.account_idp}</span>}
             <span className="font-medium truncate text-sm max-w-[120px] md:max-w-none">{log.account_email || '未知账号'}</span>
             <Badge variant="outline" className="text-xs hidden md:inline-flex">{log.model || 'unknown'}</Badge>
@@ -463,6 +470,7 @@ function LogDetailModal({ log, onClose, isMobile }: { log: LogEntry; onClose: ()
           <div className="py-4 overflow-auto h-[calc(100%-3rem)] space-y-0">
             <DetailRow label="请求 ID" value={log.request_id} mono />
             <DetailRow label="状态" value={log.status === 'success' ? '成功' : '失败'} />
+            <DetailRow label="API 协议" value={log.api_protocol === 'openai' ? 'OpenAI' : log.api_protocol === 'claude' ? 'Claude' : '-'} />
             {log.server_id ? <DetailRow label="服务器" value={log.server_id} /> : null}
             <DetailRow label="账号" value={log.account_email || '-'} />
             {log.account_idp ? <DetailRow label="账号类型" value={log.account_idp} /> : null}
@@ -505,6 +513,7 @@ function LogDetailModal({ log, onClose, isMobile }: { log: LogEntry; onClose: ()
         <div className="p-5 overflow-auto max-h-[calc(80vh-60px)] space-y-0">
           <DetailRow label="请求 ID" value={log.request_id} mono />
           <DetailRow label="状态" value={log.status === 'success' ? '成功' : '失败'} />
+          <DetailRow label="API 协议" value={log.api_protocol === 'openai' ? 'OpenAI' : log.api_protocol === 'claude' ? 'Claude' : '-'} />
           {log.server_id ? <DetailRow label="服务器" value={log.server_id} /> : null}
           <DetailRow label="账号" value={log.account_email || '-'} />
           {log.account_idp ? <DetailRow label="账号类型" value={log.account_idp} /> : null}

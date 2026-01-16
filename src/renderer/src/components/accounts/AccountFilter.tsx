@@ -1,8 +1,9 @@
 import { Button } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
-import type { AccountFilter as FilterType, SubscriptionType, AccountStatus, IdpType } from '@/types/account'
+import type { AccountFilter as FilterType, SubscriptionType, AccountStatus, IdpType, PoolStatus } from '@/types/account'
+import { UNGROUPED_ID } from '@/types/account'
 import { cn } from '@/lib/utils'
-import { Trash2, RotateCcw } from 'lucide-react'
+import { Trash2, RotateCcw, Users, Snowflake, Circle } from 'lucide-react'
 import { useMobile } from '@/hooks/use-mobile'
 
 const SubscriptionOptions: { value: SubscriptionType; label: string }[] = [
@@ -42,6 +43,13 @@ const DaysRemainingPresets: { label: string; min: number | undefined; max: numbe
   { label: '充足 (≥20天)', min: 20, max: undefined }
 ]
 
+// 账号池状态选项
+const PoolStatusOptions: { value: PoolStatus; label: string; icon: React.ReactNode; color: string }[] = [
+  { value: 'active', label: '活跃池', icon: <Users className="h-3.5 w-3.5" />, color: 'text-green-500' },
+  { value: 'cooling', label: '冷却池', icon: <Snowflake className="h-3.5 w-3.5" />, color: 'text-blue-500' },
+  { value: 'none', label: '未在池中', icon: <Circle className="h-3.5 w-3.5" />, color: 'text-muted-foreground' }
+]
+
 // 解析 ARGB 颜色转换为 CSS rgba
 function toRgba(argbColor: string): string {
   // 支持格式: #AARRGGBB 或 #RRGGBB
@@ -74,8 +82,13 @@ export function AccountFilterPanel(): React.ReactNode {
     filter.usageMax !== undefined ||
     filter.daysRemainingMin !== undefined ||
     filter.daysRemainingMax !== undefined ||
-    filter.showDeleted
+    filter.showDeleted ||
+    filter.poolStatuses?.length
   )
+
+  // 计算未分组账号数量
+  const ungroupedCount = Array.from(useAccountsStore.getState().accounts.values())
+    .filter(a => !a.groupId && !a.isDel).length
 
   // 切换显示已删除账号
   const toggleShowDeleted = (): void => {
@@ -252,39 +265,57 @@ export function AccountFilterPanel(): React.ReactNode {
 
       {/* 第二行：分组 + 标签 + 范围筛选 */}
       <div className="space-y-4">
-        {/* 分组 - 高度占用更大，因为分组通常比标签多 */}
-        {groups.size > 0 && (
-          <div className="flex items-start gap-4">
-            <div className="w-16 text-xs font-medium text-muted-foreground pt-1.5 shrink-0">分组</div>
-            <div className={cn(
-              "flex flex-wrap gap-2 overflow-y-auto scrollbar-thin pr-1",
-              isMobile ? "max-h-[180px]" : "max-h-[240px]"
-            )}>
-              {Array.from(groups.values()).map((group) => {
-                const isActive = filter.groupIds?.includes(group.id)
-                return (
-                  <button
-                    key={group.id}
-                    className={cn(
-                      'px-3 py-1.5 text-xs rounded-lg border transition-all duration-200 flex items-center gap-1.5 h-fit',
-                      isActive
-                        ? 'text-white border-transparent shadow-sm'
-                        : 'bg-background/50 border-border/50 hover:bg-muted/80 text-foreground/80'
-                    )}
-                    style={isActive && group.color ? { backgroundColor: toRgba(group.color) } : undefined}
-                    onClick={() => toggleArrayFilter('groupIds', group.id)}
-                  >
-                    <div
-                      className="w-2 h-2 rounded-full"
-                      style={{ backgroundColor: isActive ? 'white' : (group.color || '#888') }}
-                    />
-                    {group.name}
-                  </button>
-                )
-              })}
-            </div>
+        {/* 分组 - 包含"未分组"选项 */}
+        <div className="flex items-start gap-4">
+          <div className="w-16 text-xs font-medium text-muted-foreground pt-1.5 shrink-0">分组</div>
+          <div className={cn(
+            "flex flex-wrap gap-2 overflow-y-auto scrollbar-thin pr-1",
+            isMobile ? "max-h-[180px]" : "max-h-[240px]"
+          )}>
+            {/* 未分组选项 */}
+            <button
+              className={cn(
+                'px-3 py-1.5 text-xs rounded-lg border transition-all duration-200 flex items-center gap-1.5 h-fit',
+                filter.groupIds?.includes(UNGROUPED_ID)
+                  ? 'bg-muted text-foreground border-muted-foreground/30 shadow-sm'
+                  : 'bg-background/50 border-border/50 hover:bg-muted/80 text-foreground/80'
+              )}
+              onClick={() => toggleArrayFilter('groupIds', UNGROUPED_ID)}
+            >
+              <div className="w-2 h-2 rounded-full bg-muted-foreground/50" />
+              未分组
+              <span className={cn(
+                "text-[10px]",
+                filter.groupIds?.includes(UNGROUPED_ID) ? "text-foreground/70" : "text-muted-foreground"
+              )}>
+                {ungroupedCount}
+              </span>
+            </button>
+            {/* 已有分组 */}
+            {Array.from(groups.values()).map((group) => {
+              const isActive = filter.groupIds?.includes(group.id)
+              return (
+                <button
+                  key={group.id}
+                  className={cn(
+                    'px-3 py-1.5 text-xs rounded-lg border transition-all duration-200 flex items-center gap-1.5 h-fit',
+                    isActive
+                      ? 'text-white border-transparent shadow-sm'
+                      : 'bg-background/50 border-border/50 hover:bg-muted/80 text-foreground/80'
+                  )}
+                  style={isActive && group.color ? { backgroundColor: toRgba(group.color) } : undefined}
+                  onClick={() => toggleArrayFilter('groupIds', group.id)}
+                >
+                  <div
+                    className="w-2 h-2 rounded-full"
+                    style={{ backgroundColor: isActive ? 'white' : (group.color || '#888') }}
+                  />
+                  {group.name}
+                </button>
+              )
+            })}
           </div>
-        )}
+        </div>
 
         {/* 标签 - 高度占用较小，因为标签通常比分组少 */}
         {tags.size > 0 && (
