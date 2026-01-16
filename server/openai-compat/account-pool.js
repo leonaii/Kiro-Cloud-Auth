@@ -13,10 +13,12 @@
  * - 性能监控：记录查询耗时和缓存命中率
  * - 告警机制：账号池状态异常时触发告警
  * - 活跃池/冷却池机制：限制活跃账号数量，异常账号自动冷却
+ * - 工作时段控制：非工作日/非工作时段自动禁用活跃池
  */
 
 import { rowToAccount } from '../models/account.js'
 import { AlertType, AlertSeverity } from './system-logger.js'
+import { getWorkingStatus } from '../utils/working-hours.js'
 
 // 缓存配置
 const CACHE_EXPIRY_MS = 60000 // 缓存有效期 60 秒
@@ -154,6 +156,7 @@ class AccountPool {
 
   /**
    * 启动活跃池检测定时任务
+   * 注意：会检查工作状态，非工作日/非工作时段不会初始化活跃池
    */
   startActivePoolMonitor() {
     if (!this.activePoolConfig.enabled) {
@@ -162,6 +165,18 @@ class AccountPool {
     }
 
     if (this.activePoolCheckInterval) {
+      return
+    }
+
+    // 检查工作状态
+    const workingStatus = getWorkingStatus()
+    if (!workingStatus.isServiceAvailable) {
+      console.log(`[AccountPool] Active pool monitor skipped: ${workingStatus.message}`)
+      // 仍然启动定时器，以便在工作时段开始时自动初始化
+      this.activePoolCheckInterval = setInterval(async () => {
+        await this.checkAndMaintainActivePool()
+      }, ACTIVE_POOL_CHECK_INTERVAL_MS)
+      console.log(`[AccountPool] Active pool monitor started in standby mode (will activate during working hours)`)
       return
     }
 
@@ -286,6 +301,14 @@ class AccountPool {
       return
     }
 
+    // 检查工作状态
+    const workingStatus = getWorkingStatus()
+    if (!workingStatus.isServiceAvailable) {
+      console.log(`[AccountPool] Active pool initialization skipped: ${workingStatus.message}`)
+      this.activePoolInitialized = false // 标记为未初始化，以便工作时段开始时重新初始化
+      return
+    }
+
     try {
       console.log('[AccountPool] Initializing active pool...')
 
@@ -387,7 +410,27 @@ class AccountPool {
    * - 补充活跃池
    */
   async checkAndMaintainActivePool() {
-    if (!this.activePoolConfig.enabled || !this.activePoolInitialized) {
+    if (!this.activePoolConfig.enabled) {
+      return
+    }
+
+    // 检查工作状态
+    const workingStatus = getWorkingStatus()
+    if (!workingStatus.isServiceAvailable) {
+      // 非工作时段，如果活跃池已初始化，则清空它
+      if (this.activePoolInitialized && this.activePool.size > 0) {
+        console.log(`[AccountPool] Clearing active pool: ${workingStatus.message}`)
+        this.activePool.clear()
+        this.coolingPool.clear()
+        this.activePoolInitialized = false
+      }
+      return
+    }
+
+    // 工作时段，如果活跃池未初始化，则初始化它
+    if (!this.activePoolInitialized) {
+      console.log('[AccountPool] Working hours started, initializing active pool...')
+      await this.initializeActivePool()
       return
     }
 
@@ -797,10 +840,17 @@ class AccountPool {
 
   /**
    * 从活跃池获取下一个账号（轮询）
+   * 注意：非工作时段会返回 null，由调用方决定是否使用传统模式
    * @returns {object|null} 账号对象或 null
    */
   getNextFromActivePool() {
     if (!this.activePoolConfig.enabled || this.activePool.size === 0) {
+      return null
+    }
+
+    // 检查工作状态 - 非工作时段不使用活跃池
+    const workingStatus = getWorkingStatus()
+    if (!workingStatus.isServiceAvailable) {
       return null
     }
 

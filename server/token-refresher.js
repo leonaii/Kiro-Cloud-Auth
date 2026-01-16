@@ -1420,7 +1420,7 @@ class TokenRefresher {
 
     // 先等待到下一个整点时间，然后开始固定间隔执行
     this.timer = setTimeout(() => {
-      // 执行第一次检查
+      // 执行第一次检查（checkAndRefresh 内部会检查工作时段）
       this.checkAndRefresh().catch(err => {
         console.error('[TokenRefresher] Check and refresh error:', err)
       })

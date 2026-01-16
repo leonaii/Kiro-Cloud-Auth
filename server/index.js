@@ -389,7 +389,7 @@ async function start() {
     // 初始化工作日缓存
     await initWorkdayCache()
     const workingStatus = getWorkingStatus()
-    console.log(`✓ Working hours initialized: ${workingStatus.isWorkday ? '工作日' : '非工作日'}, ${workingStatus.startHour}:00-${workingStatus.endHour}:00`)
+    console.log(`✓ Working hours initialized: ${workingStatus.isWorkday ? '工作日' : '非工作日'}, ${workingStatus.startHour}:00-${workingStatus.endHour}:00, isServiceAvailable: ${workingStatus.isServiceAvailable}`)
 
     // 启动系统日志清理任务
     systemLogger.startCleanupTask()
@@ -402,9 +402,19 @@ async function start() {
     })
 
     // 启动账号池监控（accountPool 已在模块加载时创建）
+    // 注意：活跃池会根据工作状态自动启用/禁用
     accountPool.startHealthMonitor()
     accountPool.startActivePoolMonitor()
-    console.log(`✓ Account pool initialized (active pool enabled: ${accountPool.activePoolConfig.enabled}, limit: ${accountPool.activePoolConfig.limit})`)
+    
+    // 输出账号池状态（考虑工作状态）
+    if (!accountPool.activePoolConfig.enabled) {
+      console.log(`✓ Account pool: active pool DISABLED by config`)
+    } else if (!workingStatus.isServiceAvailable) {
+      console.log(`✓ Account pool: active pool in STANDBY mode (${workingStatus.message})`)
+      console.log(`  - Will auto-activate during working hours (${workingStatus.startHour}:00-${workingStatus.endHour}:00)`)
+    } else {
+      console.log(`✓ Account pool: active pool ENABLED (limit: ${accountPool.activePoolConfig.limit})`)
+    }
 
     // 将 accountPool 实例传递给监控模块
     setMonitoringAccountPool(accountPool)
