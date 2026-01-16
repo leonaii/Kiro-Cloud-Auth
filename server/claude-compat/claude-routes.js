@@ -757,13 +757,32 @@ async function handleNonStreamResponse(req, res, options) {
       apiProtocol: 'claude'
     })
 
+    // 确定 stop_reason：如果有工具调用则为 tool_use，否则为 end_turn
+    const hasToolCalls = result.parsed.toolCalls && result.parsed.toolCalls.length > 0
+    const stopReason = hasToolCalls ? 'tool_use' : 'end_turn'
+
+    // 构建内容块：如果有工具调用，需要将其添加到 contentBlocks 中
+    let finalContentBlocks = result.parsed.contentBlocks || []
+    if (hasToolCalls) {
+      // 将工具调用添加到内容块中
+      finalContentBlocks = [
+        ...finalContentBlocks,
+        ...result.parsed.toolCalls.map(tc => ({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.name,
+          input: tc.input
+        }))
+      ]
+    }
+
     const response = buildClaudeResponse(
       result.parsed.content,
       model,
       inputTokens,
       outputTokens,
-      'end_turn',
-      result.parsed.contentBlocks
+      stopReason,
+      finalContentBlocks.length > 0 ? finalContentBlocks : null
     )
 
     res.json(response)
