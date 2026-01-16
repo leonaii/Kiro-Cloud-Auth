@@ -54,7 +54,8 @@ class RequestLogger {
     isThinking = false,
     thinkingBudget = 0,
     headerVersion = 1,
-    requestHeaders = null
+    requestHeaders = null,
+    apiProtocol = 'openai'  // API 协议类型：openai 或 claude
   }) {
     // 脱敏并序列化请求头
     const sanitizedHeaders = this.sanitizeHeaders(requestHeaders)
@@ -65,8 +66,8 @@ class RequestLogger {
       `INSERT INTO api_request_logs
        (server_id, request_id, account_id, account_email, account_idp, model, is_stream, status,
         error_type, error_message, request_tokens, response_tokens,
-        duration_ms, client_ip, user_agent, is_thinking, thinking_budget, header_version, request_headers)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        duration_ms, client_ip, user_agent, is_thinking, thinking_budget, header_version, request_headers, api_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         this.serverId,
         requestId || uuidv4(),
@@ -86,7 +87,8 @@ class RequestLogger {
         isThinking ? 1 : 0,
         thinkingBudget || 0,
         headerVersion || 1,
-        headersJson
+        headersJson,
+        apiProtocol || 'openai'
       ]
     ).catch(error => {
       console.error('[RequestLogger] Failed to log request:', error.message)
@@ -126,7 +128,7 @@ class RequestLogger {
   /**
    * 获取日志列表
    */
-  async getLogs({ page = 1, pageSize = 50, status, accountId, serverId, startTime, endTime } = {}) {
+  async getLogs({ page = 1, pageSize = 50, status, accountId, serverId, startTime, endTime, apiProtocol } = {}) {
     try {
       let whereClause = '1=1'
       const params = []
@@ -144,6 +146,11 @@ class RequestLogger {
       if (accountId) {
         whereClause += ' AND account_id = ?'
         params.push(accountId)
+      }
+
+      if (apiProtocol) {
+        whereClause += ' AND api_protocol = ?'
+        params.push(apiProtocol)
       }
 
       if (startTime) {
@@ -243,6 +250,20 @@ class RequestLogger {
         LIMIT 10
       `)
 
+      // 按 API 协议统计
+      const [protocolRows] = await this.dbPool.query(`
+        SELECT
+          api_protocol,
+          COUNT(*) as count,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success,
+          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as errors,
+          SUM(request_tokens) as request_tokens,
+          SUM(response_tokens) as response_tokens
+        FROM api_request_logs
+        WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        GROUP BY api_protocol
+      `)
+
       return {
         total: stats.total || 0,
         successCount: stats.success_count || 0,
@@ -252,7 +273,8 @@ class RequestLogger {
         totalRequestTokens: stats.total_request_tokens || 0,
         totalResponseTokens: stats.total_response_tokens || 0,
         hourly: hourlyRows,
-        errorTypes: errorRows
+        errorTypes: errorRows,
+        byProtocol: protocolRows
       }
     } catch (error) {
       console.error('[RequestLogger] Failed to get stats:', error.message)

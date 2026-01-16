@@ -9,6 +9,12 @@ import KiroClient, { SUPPORTED_MODELS, checkThinkingMode } from './kiro-client.j
 import AccountPool from './account-pool.js'
 import RequestLogger from './request-logger.js'
 import { validateApiKey } from './auth-middleware.js'
+import {
+  estimateTokens,
+  estimateInputTokens,
+  estimateOutputTokens,
+  getContentText
+} from './token-counter.js'
 
 const router = Router()
 let accountPool = null
@@ -18,22 +24,25 @@ let dbPool = null
 
 /**
  * 初始化路由
+ * @param {object} pool - 数据库连接池
+ * @param {object} sysLogger - 系统日志实例
+ * @param {AccountPool} externalAccountPool - 外部账号池实例（可选，用于共享活跃池）
  */
-export function initOpenAIRoutes(pool, sysLogger = null) {
+export function initOpenAIRoutes(pool, sysLogger = null, externalAccountPool = null) {
   dbPool = pool
   systemLogger = sysLogger
-  accountPool = new AccountPool(dbPool, systemLogger)
+  // 如果提供了外部账号池，使用它；否则创建新实例
+  accountPool = externalAccountPool || new AccountPool(dbPool, systemLogger)
   requestLogger = new RequestLogger(dbPool)
   requestLogger.startCleanup()
   return router
 }
 
 /**
- * 估算 token 数量（简单实现）
+ * 获取当前使用的账号池实例
  */
-function estimateTokens(text) {
-  if (!text) return 0
-  return Math.ceil(text.length / 4)
+export function getAccountPool() {
+  return accountPool
 }
 
 /**
@@ -242,7 +251,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         userAgent,
         isThinking,
         thinkingBudget,
-        requestHeaders: req.headers
+        requestHeaders: req.headers,
+        apiProtocol: 'openai'
       })
 
       return res.status(400).json({
@@ -279,7 +289,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             userAgent,
             isThinking,
             thinkingBudget,
-            requestHeaders: req.headers
+            requestHeaders: req.headers,
+            apiProtocol: 'openai'
           })
 
           return res.status(404).json({
@@ -305,7 +316,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             userAgent,
             isThinking,
             thinkingBudget,
-            requestHeaders: req.headers
+            requestHeaders: req.headers,
+            apiProtocol: 'openai'
           })
 
           return res.status(403).json({
@@ -334,7 +346,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         userAgent,
         isThinking,
         thinkingBudget,
-        requestHeaders: req.headers
+        requestHeaders: req.headers,
+        apiProtocol: 'openai'
       })
 
       return res.status(503).json({
@@ -450,6 +463,9 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         res.write(buildStreamChunk('', model, 'stop'))
         res.write('data: [DONE]\n\n')
 
+        // 标记账号调用成功（重置错误计数）
+        accountPool.markAccountSuccess(currentAccount.id)
+
         const outputTokens = estimateTokens(fullContent)
         requestLogger.logSuccess({
           requestId,
@@ -465,7 +481,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           isThinking,
           thinkingBudget,
           headerVersion: currentAccount.header_version || 1,
-          requestHeaders: kiroHeaders
+          requestHeaders: kiroHeaders,
+          apiProtocol: 'openai'
         })
       } catch (error) {
         hasError = true
@@ -524,6 +541,9 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
               res.write(buildStreamChunk('', model, 'stop'))
               res.write('data: [DONE]\n\n')
 
+              // 标记新账号调用成功（重置错误计数）
+              accountPool.markAccountSuccess(currentAccount.id)
+
               const outputTokens = estimateTokens(fullContent)
               requestLogger.logSuccess({
                 requestId,
@@ -539,7 +559,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
                 isThinking,
                 thinkingBudget,
                 headerVersion: currentAccount.header_version || 1,
-                requestHeaders: kiroHeaders
+                requestHeaders: kiroHeaders,
+                apiProtocol: 'openai'
               })
 
               console.log(`[OpenAI API] Successfully recovered from TOKEN_EXPIRED by switching accounts`)
@@ -574,7 +595,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             isThinking,
             thinkingBudget,
             headerVersion: currentAccount.header_version || 1,
-            requestHeaders: kiroHeaders
+            requestHeaders: kiroHeaders,
+            apiProtocol: 'openai'
           })
 
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -639,6 +661,9 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           }
         }
 
+        // 标记账号调用成功（重置错误计数）
+        accountPool.markAccountSuccess(result.account.id)
+
         const outputTokens = estimateTokens(result.parsed.content)
         requestLogger.logSuccess({
           requestId,
@@ -654,7 +679,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           isThinking,
           thinkingBudget,
           headerVersion: result.account.header_version || 1,
-          requestHeaders: kiroHeaders
+          requestHeaders: kiroHeaders,
+          apiProtocol: 'openai'
         })
 
         // 传递 contentBlocks 以支持 thinking 内容
@@ -688,7 +714,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           isThinking,
           thinkingBudget,
           headerVersion: account.header_version || 1,
-          requestHeaders: kiroHeaders
+          requestHeaders: kiroHeaders,
+          apiProtocol: 'openai'
         })
 
         res.status(500).json({
@@ -718,7 +745,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       isThinking,
       thinkingBudget,
       headerVersion: account?.header_version || 1,
-      requestHeaders: account ? kiroHeaders : req.headers
+      requestHeaders: account ? kiroHeaders : req.headers,
+      apiProtocol: 'openai'
     })
 
     res.status(500).json({

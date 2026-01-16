@@ -1427,8 +1427,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const search = filter.search.toLowerCase()
       result = result.filter(
         (a) =>
-          a.email.toLowerCase().includes(search) ||
-          a.nickname?.toLowerCase().includes(search)
+          (a.email || '').toLowerCase().includes(search) ||
+          (a.nickname || '').toLowerCase().includes(search)
       )
     }
 

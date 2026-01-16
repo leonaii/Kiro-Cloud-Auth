@@ -58,8 +58,8 @@ export function HomePageWeb(): React.ReactNode {
     if (searchTerm) {
       const term = searchTerm.toLowerCase()
       data = data.filter(acc =>
-        acc.email.toLowerCase().includes(term) ||
-        (acc.nickname && acc.nickname.toLowerCase().includes(term))
+        (acc.email || '').toLowerCase().includes(term) ||
+        (acc.nickname || '').toLowerCase().includes(term)
       )
     }
 

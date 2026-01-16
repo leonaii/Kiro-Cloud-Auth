@@ -68,8 +68,8 @@ interface AccountCardProps {
   index?: number // 用于交错动画
 }
 
-const getSubscriptionColor = (type: string, title?: string): string => {
-  const text = (title || type).toUpperCase()
+const getSubscriptionColor = (type?: string | null, title?: string | null): string => {
+  const text = (title || type || '').toUpperCase()
   if (text.includes('PRO+') || text.includes('PRO_PLUS') || text.includes('PROPLUS'))
     return 'bg-purple-500'
   if (text.includes('POWER')) return 'bg-amber-500'
@@ -78,8 +78,8 @@ const getSubscriptionColor = (type: string, title?: string): string => {
 }
 
 // IDP 平台颜色配置
-const getIdpColor = (idp: string): string => {
-  const idpLower = idp.toLowerCase()
+const getIdpColor = (idp?: string | null): string => {
+  const idpLower = (idp || '').toLowerCase()
   if (idpLower.includes('google')) return 'bg-blue-500 text-white border-blue-500'
   if (idpLower.includes('builderid')) return 'bg-orange-500 text-white border-orange-500'
   if (idpLower.includes('github')) return 'bg-gray-700 text-white border-gray-700'

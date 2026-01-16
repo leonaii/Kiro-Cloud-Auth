@@ -43,6 +43,12 @@ import { requireAuth } from './middleware/auth-middleware.js'
 // OpenAI 兼容 API
 import { initOpenAIRoutes } from './openai-compat/openai-routes.js'
 
+// Claude 兼容 API
+import { initClaudeRoutes } from './openai-compat/claude-routes.js'
+
+// 账号池管理
+import AccountPool from './openai-compat/account-pool.js'
+
 // Token 刷新服务
 import TokenRefresher from './token-refresher.js'
 
@@ -88,14 +94,27 @@ const systemLogger = initSystemLogger(pool)
 // Token 刷新服务实例（全局，用于获取下次检测时间）
 let tokenRefresher = null
 
+// 账号池实例（全局，用于活跃池管理）
+// 在模块加载时创建，以便路由可以使用
+let accountPool = new AccountPool(pool, systemLogger)
+
 // 获取 Token 刷新服务实例
 export function getTokenRefresher() {
   return tokenRefresher
 }
 
-// OpenAI 兼容 API
-const openaiRoutes = initOpenAIRoutes(pool, systemLogger)
+// 获取账号池实例
+export function getAccountPool() {
+  return accountPool
+}
+
+// OpenAI 兼容 API（传入共享的 accountPool）
+const openaiRoutes = initOpenAIRoutes(pool, systemLogger, accountPool)
 app.use(openaiRoutes)
+
+// Claude 兼容 API（传入共享的 accountPool）
+const claudeRoutes = initClaudeRoutes(pool, systemLogger, accountPool)
+app.use(claudeRoutes)
 
 // 系统日志 API
 app.get('/api/system-logs', async (req, res) => {
@@ -282,6 +301,13 @@ async function gracefulShutdown(signal) {
     console.log('[Server] Token refresher stopped')
   }
 
+  // 停止账号池监控
+  if (accountPool) {
+    accountPool.stopActivePoolMonitor()
+    accountPool.stopHealthMonitor()
+    console.log('[Server] Account pool monitors stopped')
+  }
+
   // 停止系统日志清理
   systemLogger.stopCleanupTask()
   console.log('[Server] System logger cleanup stopped')
@@ -339,10 +365,15 @@ async function start() {
       details: { version: APP_VERSION, serverId: SERVER_ID }
     })
 
+    // 启动账号池监控（accountPool 已在模块加载时创建）
+    accountPool.startHealthMonitor()
+    accountPool.startActivePoolMonitor()
+    console.log(`✓ Account pool initialized (active pool enabled: ${accountPool.activePoolConfig.enabled}, limit: ${accountPool.activePoolConfig.limit})`)
+
     // 启动 Token 自动刷新服务（可通过环境变量禁用）
     const disableTokenRefresh = process.env.DISABLE_TOKEN_REFRESH === 'true'
     if (!disableTokenRefresh) {
-      tokenRefresher = new TokenRefresher(pool, systemLogger)
+      tokenRefresher = new TokenRefresher(pool, systemLogger, accountPool)
       tokenRefresher.start()
       // 将 tokenRefresher 实例传递给监控模块
       setMonitoringTokenRefresher(tokenRefresher)
@@ -353,6 +384,7 @@ async function start() {
       console.log(`✓ Server [${SERVER_ID}] running on http://0.0.0.0:${PORT}`)
       console.log(`✓ Database: ${process.env.DB_HOST || '127.0.0.1'}:${process.env.DB_PORT || 3306}`)
       console.log(`✓ Token auto-refresh: ${disableTokenRefresh ? 'DISABLED' : 'enabled'}`)
+      console.log(`✓ Active pool: ${accountPool.activePoolConfig.enabled ? `enabled (limit: ${accountPool.activePoolConfig.limit})` : 'DISABLED'}`)
       console.log(`✓ OpenAI compatible API: http://0.0.0.0:${PORT}/v1/chat/completions`)
       console.log(`✓ Pool status: http://0.0.0.0:${PORT}/v1/pool/status`)
       console.log(`✓ Accounts V2 API: http://0.0.0.0:${PORT}/api/v2/accounts`)

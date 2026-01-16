@@ -10,3 +10,6 @@ npm-debug.log*
 .DS_Store
 .env
 .env.local
+nginx.active.conf
+nginx.active.conf.conf
+nginx.active.conf

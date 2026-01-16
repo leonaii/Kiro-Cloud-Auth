@@ -171,6 +171,7 @@ export const API_REQUEST_LOGS_COLUMNS = [
   { name: 'thinking_budget', definition: 'INT DEFAULT 0' },
   { name: 'header_version', definition: 'INT DEFAULT 1' },
   { name: 'request_headers', definition: 'TEXT' },
+  { name: 'api_protocol', definition: "VARCHAR(20) DEFAULT 'openai'" },  // API 协议类型：openai 或 claude
   { name: 'created_at', definition: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' }
 ]
 

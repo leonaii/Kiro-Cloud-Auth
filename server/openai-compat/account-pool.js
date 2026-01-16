@@ -12,6 +12,7 @@
  * - 分布式轮询索引：使用数据库原子操作实现跨进程/服务器的负载均衡
  * - 性能监控：记录查询耗时和缓存命中率
  * - 告警机制：账号池状态异常时触发告警
+ * - 活跃池/冷却池机制：限制活跃账号数量，异常账号自动冷却
  */
 
 import { rowToAccount } from '../models/account.js'
@@ -21,6 +22,19 @@ import { AlertType, AlertSeverity } from './system-logger.js'
 const CACHE_EXPIRY_MS = 60000 // 缓存有效期 60 秒
 const DB_CHECK_INTERVAL_MS = 30000 // 数据库连接检测间隔 30 秒
 const HEALTH_MONITOR_INTERVAL_MS = 5 * 60 * 1000 // 健康监控间隔 5 分钟
+const ACTIVE_POOL_CHECK_INTERVAL_MS = 60 * 1000 // 活跃池检测间隔 1 分钟
+
+// 活跃池配置（可通过环境变量覆盖）
+const ACTIVE_POOL_CONFIG = {
+  // 活跃池上限（默认 5 个账号）
+  limit: parseInt(process.env.ACTIVE_POOL_LIMIT) || 5,
+  // 异常累计阈值（超过此值移入冷却池）
+  errorThreshold: parseInt(process.env.ACTIVE_POOL_ERROR_THRESHOLD) || 5,
+  // 冷却时间（毫秒，默认 10 分钟）
+  coolingPeriodMs: parseInt(process.env.ACTIVE_POOL_COOLING_PERIOD_MS) || 10 * 60 * 1000,
+  // 是否启用活跃池机制（默认启用）
+  enabled: process.env.ACTIVE_POOL_ENABLED !== 'false'
+}
 
 // 告警阈值配置（可通过环境变量覆盖）
 const ALERT_THRESHOLDS = {
@@ -61,6 +75,20 @@ class AccountPool {
     this.lastDbCheckTime = 0
     this.dbCheckInterval = DB_CHECK_INTERVAL_MS
 
+    // ========== 活跃池/冷却池机制 ==========
+    // 活跃池：Map<accountId, { account, addedAt, errorCount, lastErrorAt }>
+    this.activePool = new Map()
+    // 冷却池：Map<accountId, { account, coolingStartAt, errorCount, lastError }>
+    this.coolingPool = new Map()
+    // 活跃池配置
+    this.activePoolConfig = { ...ACTIVE_POOL_CONFIG }
+    // 活跃池检测定时器
+    this.activePoolCheckInterval = null
+    // 活跃池轮询索引
+    this.activePoolIndex = 0
+    // 活跃池初始化标志
+    this.activePoolInitialized = false
+
     // 统计信息
     this.stats = {
       cacheHits: 0,
@@ -81,7 +109,12 @@ class AccountPool {
       // 性能监控统计
       queryDurations: [],
       dbConnectionFailureCount: 0,
-      lastDbConnectionFailure: null
+      lastDbConnectionFailure: null,
+      // 活跃池统计
+      activePoolPromotions: 0,
+      activePoolDemotions: 0,
+      coolingPoolRecoveries: 0,
+      activePoolErrors: 0
     }
 
     // 健康监控定时器
@@ -114,6 +147,533 @@ class AccountPool {
       clearInterval(this.healthMonitorInterval)
       this.healthMonitorInterval = null
       console.log('[AccountPool] Health monitor stopped')
+    }
+  }
+
+  // ========== 活跃池/冷却池管理方法 ==========
+
+  /**
+   * 启动活跃池检测定时任务
+   */
+  startActivePoolMonitor() {
+    if (!this.activePoolConfig.enabled) {
+      console.log('[AccountPool] Active pool mechanism is disabled')
+      return
+    }
+
+    if (this.activePoolCheckInterval) {
+      return
+    }
+
+    // 立即初始化活跃池
+    this.initializeActivePool().catch(err => {
+      console.error('[AccountPool] Failed to initialize active pool:', err.message)
+    })
+
+    this.activePoolCheckInterval = setInterval(async () => {
+      await this.checkAndMaintainActivePool()
+    }, ACTIVE_POOL_CHECK_INTERVAL_MS)
+
+    console.log(`[AccountPool] Active pool monitor started (limit: ${this.activePoolConfig.limit}, error threshold: ${this.activePoolConfig.errorThreshold})`)
+  }
+
+  /**
+   * 停止活跃池检测定时任务
+   */
+  stopActivePoolMonitor() {
+    if (this.activePoolCheckInterval) {
+      clearInterval(this.activePoolCheckInterval)
+      this.activePoolCheckInterval = null
+      console.log('[AccountPool] Active pool monitor stopped')
+    }
+  }
+
+  /**
+   * 初始化活跃池
+   * 从数据库加载账号并填充活跃池
+   */
+  async initializeActivePool() {
+    if (!this.activePoolConfig.enabled) {
+      return
+    }
+
+    try {
+      console.log('[AccountPool] Initializing active pool...')
+
+      // 获取所有可用账号
+      const accounts = await this.getAvailableAccounts(null)
+
+      if (accounts.length === 0) {
+        console.warn('[AccountPool] No available accounts for active pool')
+        this.activePoolInitialized = true
+        return
+      }
+
+      // 清空现有池
+      this.activePool.clear()
+      this.coolingPool.clear()
+
+      // 按使用率排序，选择使用率最低的账号加入活跃池
+      const sortedAccounts = [...accounts].sort((a, b) => a.usage.percentUsed - b.usage.percentUsed)
+
+      // 填充活跃池（最多 limit 个）
+      const limit = Math.min(this.activePoolConfig.limit, sortedAccounts.length)
+      for (let i = 0; i < limit; i++) {
+        const account = sortedAccounts[i]
+        this.activePool.set(account.id, {
+          account,
+          addedAt: Date.now(),
+          errorCount: 0,
+          lastErrorAt: null
+        })
+      }
+
+      this.activePoolInitialized = true
+      console.log(`[AccountPool] Active pool initialized with ${this.activePool.size} accounts (total available: ${accounts.length})`)
+
+      // 记录日志
+      if (this.systemLogger) {
+        await this.systemLogger.logAccountPool({
+          action: 'active_pool_initialized',
+          message: `活跃池初始化完成: ${this.activePool.size}/${this.activePoolConfig.limit} 个账号`,
+          details: {
+            activePoolSize: this.activePool.size,
+            limit: this.activePoolConfig.limit,
+            totalAvailable: accounts.length,
+            accounts: Array.from(this.activePool.values()).map(p => ({
+              id: p.account.id,
+              email: p.account.email,
+              usagePercent: p.account.usage.percentUsed
+            }))
+          },
+          level: 'info'
+        }).catch(() => {})
+      }
+    } catch (error) {
+      console.error('[AccountPool] Failed to initialize active pool:', error.message)
+      this.activePoolInitialized = true // 标记为已初始化，避免重复尝试
+    }
+  }
+
+  /**
+   * 检查并维护活跃池
+   * - 检查活跃池账号是否健康
+   * - 从冷却池恢复账号
+   * - 补充活跃池
+   */
+  async checkAndMaintainActivePool() {
+    if (!this.activePoolConfig.enabled || !this.activePoolInitialized) {
+      return
+    }
+
+    try {
+      const now = Date.now()
+
+      // 1. 检查活跃池中的账号健康状态
+      await this.checkActivePoolHealth()
+
+      // 2. 检查冷却池中是否有账号可以恢复
+      await this.checkCoolingPoolRecovery(now)
+
+      // 3. 如果活跃池未满，从可用账号中补充（进位法原则）
+      await this.replenishActivePool()
+
+      // 4. 记录状态
+      console.log(`[AccountPool] Pool status: active=${this.activePool.size}/${this.activePoolConfig.limit}, cooling=${this.coolingPool.size}`)
+    } catch (error) {
+      console.error('[AccountPool] Failed to maintain active pool:', error.message)
+    }
+  }
+
+  /**
+   * 检查活跃池账号健康状态
+   */
+  async checkActivePoolHealth() {
+    const accountsToRemove = []
+
+    for (const [accountId, poolEntry] of this.activePool.entries()) {
+      try {
+        // 从数据库获取最新状态
+        const [rows] = await this.dbPool.query(
+          `SELECT id, status, last_error FROM accounts WHERE id = ? AND (is_del = FALSE OR is_del IS NULL)`,
+          [accountId]
+        )
+
+        if (rows.length === 0) {
+          // 账号已删除
+          accountsToRemove.push({ accountId, reason: 'deleted' })
+          continue
+        }
+
+        const row = rows[0]
+
+        // 检查状态
+        if (row.status === 'banned') {
+          accountsToRemove.push({ accountId, reason: 'banned', lastError: row.last_error })
+        } else if (row.status === 'error') {
+          accountsToRemove.push({ accountId, reason: 'error', lastError: row.last_error })
+        }
+      } catch (error) {
+        console.error(`[AccountPool] Failed to check health for account ${accountId}:`, error.message)
+      }
+    }
+
+    // 移除不健康的账号到冷却池
+    for (const { accountId, reason, lastError } of accountsToRemove) {
+      await this.moveToCoolingPool(accountId, reason, lastError)
+    }
+  }
+
+  /**
+   * 检查冷却池中是否有账号可以恢复
+   */
+  async checkCoolingPoolRecovery(now) {
+    const accountsToRecover = []
+
+    for (const [accountId, coolingEntry] of this.coolingPool.entries()) {
+      // 检查冷却时间是否已过
+      const coolingElapsed = now - coolingEntry.coolingStartAt
+      if (coolingElapsed < this.activePoolConfig.coolingPeriodMs) {
+        continue
+      }
+
+      try {
+        // 从数据库获取最新状态
+        const [rows] = await this.dbPool.query(
+          `SELECT id, email, status FROM accounts
+           WHERE id = ?
+             AND status = 'active'
+             AND (is_del = FALSE OR is_del IS NULL)
+             AND cred_access_token IS NOT NULL
+             AND cred_access_token != ''`,
+          [accountId]
+        )
+
+        if (rows.length > 0) {
+          // 账号已恢复正常，可以重新加入活跃池
+          accountsToRecover.push({
+            accountId,
+            email: rows[0].email
+          })
+        } else {
+          // 账号仍然不可用，延长冷却时间
+          coolingEntry.coolingStartAt = now
+          console.log(`[AccountPool] Account ${accountId} still not healthy, extending cooling period`)
+        }
+      } catch (error) {
+        console.error(`[AccountPool] Failed to check recovery for account ${accountId}:`, error.message)
+      }
+    }
+
+    // 恢复账号到活跃池（如果活跃池未满）
+    for (const { accountId, email } of accountsToRecover) {
+      if (this.activePool.size < this.activePoolConfig.limit) {
+        await this.promoteFromCoolingPool(accountId)
+      } else {
+        console.log(`[AccountPool] Active pool is full, keeping ${email} in cooling pool`)
+      }
+    }
+  }
+
+  /**
+   * 补充活跃池（进位法原则）
+   * 当活跃池未满时，从可用账号中选择使用率最低的账号加入
+   */
+  async replenishActivePool() {
+    if (this.activePool.size >= this.activePoolConfig.limit) {
+      return
+    }
+
+    const needed = this.activePoolConfig.limit - this.activePool.size
+
+    try {
+      // 获取所有可用账号
+      const accounts = await this.getAvailableAccounts(null)
+
+      // 过滤掉已在活跃池和冷却池中的账号
+      const availableAccounts = accounts.filter(acc =>
+        !this.activePool.has(acc.id) && !this.coolingPool.has(acc.id)
+      )
+
+      if (availableAccounts.length === 0) {
+        return
+      }
+
+      // 按使用率排序（进位法：选择使用率最低的）
+      const sortedAccounts = [...availableAccounts].sort((a, b) => a.usage.percentUsed - b.usage.percentUsed)
+
+      // 添加到活跃池
+      const toAdd = Math.min(needed, sortedAccounts.length)
+      for (let i = 0; i < toAdd; i++) {
+        const account = sortedAccounts[i]
+        this.activePool.set(account.id, {
+          account,
+          addedAt: Date.now(),
+          errorCount: 0,
+          lastErrorAt: null
+        })
+        this.stats.activePoolPromotions++
+
+        console.log(`[AccountPool] Promoted account ${account.email} to active pool (usage: ${account.usage.percentUsed.toFixed(1)}%)`)
+
+        if (this.systemLogger) {
+          await this.systemLogger.logAccountPool({
+            action: 'active_pool_promotion',
+            message: `账号 ${account.email} 加入活跃池`,
+            details: {
+              accountId: account.id,
+              email: account.email,
+              usagePercent: account.usage.percentUsed,
+              activePoolSize: this.activePool.size
+            },
+            level: 'info'
+          }).catch(() => {})
+        }
+      }
+    } catch (error) {
+      console.error('[AccountPool] Failed to replenish active pool:', error.message)
+    }
+  }
+
+  /**
+   * 将账号移入冷却池
+   */
+  async moveToCoolingPool(accountId, reason, lastError = null) {
+    const poolEntry = this.activePool.get(accountId)
+    if (!poolEntry) {
+      return
+    }
+
+    // 从活跃池移除
+    this.activePool.delete(accountId)
+
+    // 添加到冷却池
+    this.coolingPool.set(accountId, {
+      account: poolEntry.account,
+      coolingStartAt: Date.now(),
+      errorCount: poolEntry.errorCount,
+      lastError: lastError || `Moved to cooling pool: ${reason}`
+    })
+
+    this.stats.activePoolDemotions++
+
+    console.log(`[AccountPool] Account ${poolEntry.account.email} moved to cooling pool (reason: ${reason}, errors: ${poolEntry.errorCount})`)
+
+    if (this.systemLogger) {
+      await this.systemLogger.logAccountPool({
+        action: 'active_pool_demotion',
+        message: `账号 ${poolEntry.account.email} 移入冷却池`,
+        details: {
+          accountId,
+          email: poolEntry.account.email,
+          reason,
+          errorCount: poolEntry.errorCount,
+          lastError,
+          coolingPeriodMs: this.activePoolConfig.coolingPeriodMs
+        },
+        level: 'warn'
+      }).catch(() => {})
+    }
+  }
+
+  /**
+   * 从冷却池恢复账号到活跃池
+   */
+  async promoteFromCoolingPool(accountId) {
+    const coolingEntry = this.coolingPool.get(accountId)
+    if (!coolingEntry) {
+      return
+    }
+
+    // 从冷却池移除
+    this.coolingPool.delete(accountId)
+
+    // 重新获取账号最新信息
+    const account = await this.getAccountById(accountId)
+    if (!account) {
+      console.warn(`[AccountPool] Cannot promote account ${accountId}: not found`)
+      return
+    }
+
+    // 添加到活跃池（重置错误计数）
+    this.activePool.set(accountId, {
+      account,
+      addedAt: Date.now(),
+      errorCount: 0,
+      lastErrorAt: null
+    })
+
+    this.stats.coolingPoolRecoveries++
+
+    console.log(`[AccountPool] Account ${account.email} recovered from cooling pool to active pool`)
+
+    if (this.systemLogger) {
+      await this.systemLogger.logAccountPool({
+        action: 'cooling_pool_recovery',
+        message: `账号 ${account.email} 从冷却池恢复到活跃池`,
+        details: {
+          accountId,
+          email: account.email,
+          previousErrorCount: coolingEntry.errorCount,
+          coolingDurationMs: Date.now() - coolingEntry.coolingStartAt
+        },
+        level: 'info'
+      }).catch(() => {})
+    }
+  }
+
+  /**
+   * 记录活跃池账号错误
+   * 如果错误累计超过阈值，移入冷却池
+   * @param {string} accountId - 账号 ID
+   * @param {string} errorMessage - 错误消息
+   * @returns {boolean} 是否移入冷却池
+   */
+  async recordActivePoolError(accountId, errorMessage) {
+    if (!this.activePoolConfig.enabled) {
+      return false
+    }
+
+    const poolEntry = this.activePool.get(accountId)
+    if (!poolEntry) {
+      return false
+    }
+
+    poolEntry.errorCount++
+    poolEntry.lastErrorAt = Date.now()
+    this.stats.activePoolErrors++
+
+    console.log(`[AccountPool] Account ${poolEntry.account.email} error count: ${poolEntry.errorCount}/${this.activePoolConfig.errorThreshold}`)
+
+    // 检查是否超过阈值
+    if (poolEntry.errorCount >= this.activePoolConfig.errorThreshold) {
+      await this.moveToCoolingPool(accountId, 'error_threshold_exceeded', errorMessage)
+      return true
+    }
+
+    return false
+  }
+
+  /**
+   * 重置活跃池账号的错误计数（成功调用后）
+   * @param {string} accountId - 账号 ID
+   */
+  resetActivePoolErrorCount(accountId) {
+    if (!this.activePoolConfig.enabled) {
+      return
+    }
+
+    const poolEntry = this.activePool.get(accountId)
+    if (poolEntry && poolEntry.errorCount > 0) {
+      poolEntry.errorCount = 0
+      poolEntry.lastErrorAt = null
+    }
+  }
+
+  /**
+   * 从活跃池获取下一个账号（轮询）
+   * @returns {object|null} 账号对象或 null
+   */
+  getNextFromActivePool() {
+    if (!this.activePoolConfig.enabled || this.activePool.size === 0) {
+      return null
+    }
+
+    const entries = Array.from(this.activePool.values())
+    const now = Date.now()
+
+    // 过滤掉 token 即将过期的账号
+    const validEntries = entries.filter(entry => {
+      if (!entry.account.credentials.expiresAt) return true
+      // 预留 15 分钟缓冲
+      return entry.account.credentials.expiresAt > now + 15 * 60 * 1000
+    })
+
+    if (validEntries.length === 0) {
+      console.warn('[AccountPool] All accounts in active pool have expired tokens')
+      return null
+    }
+
+    // 轮询选择
+    this.activePoolIndex = this.activePoolIndex % validEntries.length
+    const selected = validEntries[this.activePoolIndex]
+    this.activePoolIndex++
+
+    return selected.account
+  }
+
+  /**
+   * 获取活跃池账号列表（用于 token 刷新）
+   * @returns {Array} 活跃池账号 ID 列表
+   */
+  getActivePoolAccountIds() {
+    if (!this.activePoolConfig.enabled) {
+      return []
+    }
+    return Array.from(this.activePool.keys())
+  }
+
+  /**
+   * 获取活跃池状态
+   */
+  getActivePoolStatus() {
+    return {
+      enabled: this.activePoolConfig.enabled,
+      initialized: this.activePoolInitialized,
+      config: { ...this.activePoolConfig },
+      activePool: {
+        size: this.activePool.size,
+        limit: this.activePoolConfig.limit,
+        accounts: Array.from(this.activePool.values()).map(entry => ({
+          id: entry.account.id,
+          email: entry.account.email,
+          addedAt: entry.addedAt,
+          errorCount: entry.errorCount,
+          lastErrorAt: entry.lastErrorAt,
+          usagePercent: entry.account.usage.percentUsed
+        }))
+      },
+      coolingPool: {
+        size: this.coolingPool.size,
+        accounts: Array.from(this.coolingPool.values()).map(entry => ({
+          id: entry.account.id,
+          email: entry.account.email,
+          coolingStartAt: entry.coolingStartAt,
+          errorCount: entry.errorCount,
+          lastError: entry.lastError,
+          remainingCoolingMs: Math.max(0, this.activePoolConfig.coolingPeriodMs - (Date.now() - entry.coolingStartAt))
+        }))
+      },
+      stats: {
+        promotions: this.stats.activePoolPromotions,
+        demotions: this.stats.activePoolDemotions,
+        recoveries: this.stats.coolingPoolRecoveries,
+        errors: this.stats.activePoolErrors
+      }
+    }
+  }
+
+  /**
+   * 刷新活跃池中的账号信息
+   * 在 token 刷新后调用，更新活跃池中的账号数据
+   */
+  async refreshActivePoolAccount(accountId) {
+    if (!this.activePoolConfig.enabled) {
+      return
+    }
+
+    const poolEntry = this.activePool.get(accountId)
+    if (!poolEntry) {
+      return
+    }
+
+    try {
+      const account = await this.getAccountById(accountId)
+      if (account) {
+        poolEntry.account = account
+      }
+    } catch (error) {
+      console.error(`[AccountPool] Failed to refresh active pool account ${accountId}:`, error.message)
     }
   }
 
@@ -825,17 +1385,56 @@ class AccountPool {
   }
 
   /**
-   * 获取下一个可用账号（分布式轮询负载均衡）
+   * 获取下一个可用账号（优先使用活跃池）
    *
-   * 轮询策略：使用数据库原子操作确保跨进程/服务器的均匀分配
-   * - 按账号 ID 顺序依次选择，确保所有账号均匀使用
-   * - 新加入的账号会按 ID 顺序插入到轮询队列中
-   * - 每个分组维护独立的轮询索引（存储在数据库中）
+   * 策略：
+   * 1. 如果启用了活跃池机制，优先从活跃池获取账号
+   * 2. 如果活跃池为空或未启用，回退到传统的分布式轮询
    *
    * @param {string|null} groupId - 分组 ID，如果为 null 则从所有账号中选择
    */
   async getNextAccount(groupId = null) {
     const startTime = Date.now()
+
+    // 优先使用活跃池（仅当 groupId 为 null 时）
+    if (this.activePoolConfig.enabled && this.activePoolInitialized && !groupId) {
+      const activeAccount = this.getNextFromActivePool()
+      if (activeAccount) {
+        // 更新最后调用时间
+        activeAccount.apiLastCallAt = Date.now()
+
+        console.log(`[AccountPool] Active pool: selected account ${activeAccount.email} (pool size: ${this.activePool.size}/${this.activePoolConfig.limit})`)
+
+        this.recordQueryDuration(Date.now() - startTime, 'get_next_account_active_pool', true)
+        return activeAccount
+      }
+
+      // 活跃池为空，尝试初始化
+      if (this.activePool.size === 0) {
+        console.warn('[AccountPool] Active pool is empty, attempting to replenish...')
+        await this.replenishActivePool()
+
+        const retryAccount = this.getNextFromActivePool()
+        if (retryAccount) {
+          retryAccount.apiLastCallAt = Date.now()
+          console.log(`[AccountPool] Active pool (after replenish): selected account ${retryAccount.email}`)
+          this.recordQueryDuration(Date.now() - startTime, 'get_next_account_active_pool', true)
+          return retryAccount
+        }
+      }
+
+      // 活跃池仍然为空，回退到传统轮询
+      console.warn('[AccountPool] Active pool exhausted, falling back to round-robin')
+    }
+
+    // 传统的分布式轮询逻辑
+    return await this._getNextAccountRoundRobin(groupId, startTime)
+  }
+
+  /**
+   * 传统的分布式轮询获取账号（内部方法）
+   */
+  async _getNextAccountRoundRobin(groupId, startTime) {
     const cacheKey = groupId || '__all__'
     let accounts
     let retryCount = 0
@@ -959,8 +1558,9 @@ class AccountPool {
       const row = rows[0]
 
       // 验证数据完整性
-      if (!this.validateAccountRow(row)) {
-        console.warn(`[AccountPool] Account ${accountId} has incomplete data`)
+      const validation = this.validateAccountRow(row)
+      if (!validation.valid) {
+        console.warn(`[AccountPool] Account ${accountId} has incomplete data:`, validation.errors)
         return null
       }
 
@@ -1012,11 +1612,26 @@ class AccountPool {
 
   /**
    * 标记账号出错
+   * @param {string} accountId - 账号 ID
+   * @param {string} errorMessage - 错误消息（可选）
+   * @param {boolean} markInDb - 是否在数据库中标记为 error 状态（默认 true）
    */
-  async markAccountError(accountId) {
+  async markAccountError(accountId, errorMessage = null, markInDb = true) {
     try {
-      await this.dbPool.query("UPDATE accounts SET status = 'error' WHERE id = ?", [accountId])
-      console.log(`[AccountPool] Marked account ${accountId} as error`)
+      // 1. 记录活跃池错误（如果启用）
+      let movedToCooling = false
+      if (this.activePoolConfig.enabled) {
+        movedToCooling = await this.recordActivePoolError(accountId, errorMessage)
+      }
+
+      // 2. 如果需要在数据库中标记（且未移入冷却池，或强制标记）
+      if (markInDb && !movedToCooling) {
+        await this.dbPool.query(
+          "UPDATE accounts SET status = 'error', last_error = ? WHERE id = ?",
+          [errorMessage || 'Unknown error', accountId]
+        )
+        console.log(`[AccountPool] Marked account ${accountId} as error in database`)
+      }
 
       // 清除相关缓存
       this.invalidateCache()
@@ -1024,14 +1639,24 @@ class AccountPool {
       if (this.systemLogger) {
         await this.systemLogger.logAccountPool({
           action: 'mark_account_error',
-          message: `账号 ${accountId} 标记为错误`,
-          details: { accountId },
+          message: `账号 ${accountId} 标记为错误${movedToCooling ? '（已移入冷却池）' : ''}`,
+          details: { accountId, errorMessage, movedToCooling },
           level: 'warn'
         })
       }
     } catch (error) {
       console.error(`[AccountPool] Failed to mark account ${accountId} as error:`, error.message)
       this.stats.dbErrors++
+    }
+  }
+
+  /**
+   * 标记账号调用成功（重置错误计数）
+   * @param {string} accountId - 账号 ID
+   */
+  markAccountSuccess(accountId) {
+    if (this.activePoolConfig.enabled) {
+      this.resetActivePoolErrorCount(accountId)
     }
   }
 
@@ -1126,6 +1751,8 @@ class AccountPool {
           : 0,
         indexResetCount: this.stats.indexResetCount
       },
+      // 活跃池状态
+      activePool: this.getActivePoolStatus(),
       valid: accounts.filter(
         (acc) => !acc.credentials.expiresAt || acc.credentials.expiresAt > now
       ).length,
@@ -1138,6 +1765,9 @@ class AccountPool {
         groupId: acc.groupId,
         // 标记当前轮询位置
         isNextInQueue: idx === currentIndex,
+        // 标记是否在活跃池中
+        isInActivePool: this.activePool.has(acc.id),
+        isInCoolingPool: this.coolingPool.has(acc.id),
         usagePercent: acc.usage.percentUsed,
         expiresAt: acc.credentials.expiresAt,
         isValid: !acc.credentials.expiresAt || acc.credentials.expiresAt > now,
@@ -1436,6 +2066,18 @@ class AccountPool {
       dbConnection: {
         failureCount: this.stats.dbConnectionFailureCount,
         lastFailure: this.stats.lastDbConnectionFailure
+      },
+      // 活跃池统计
+      activePool: {
+        enabled: this.activePoolConfig.enabled,
+        initialized: this.activePoolInitialized,
+        size: this.activePool.size,
+        limit: this.activePoolConfig.limit,
+        coolingPoolSize: this.coolingPool.size,
+        promotions: this.stats.activePoolPromotions,
+        demotions: this.stats.activePoolDemotions,
+        recoveries: this.stats.coolingPoolRecoveries,
+        errors: this.stats.activePoolErrors
       }
     }
   }
@@ -1461,7 +2103,12 @@ class AccountPool {
       // 性能监控统计
       queryDurations: [],
       dbConnectionFailureCount: 0,
-      lastDbConnectionFailure: null
+      lastDbConnectionFailure: null,
+      // 活跃池统计
+      activePoolPromotions: 0,
+      activePoolDemotions: 0,
+      coolingPoolRecoveries: 0,
+      activePoolErrors: 0
     }
     console.log('[AccountPool] Stats reset')
   }

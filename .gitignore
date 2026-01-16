@@ -14,7 +14,7 @@ docs
 .env
 
 # 动态生成的 nginx 配置
-nginx.conf.active
+nginx.active.conf
 
 #md
 HEADER_VERSION_IMPLEMENTATION.md

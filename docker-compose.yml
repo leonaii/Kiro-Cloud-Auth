@@ -1,6 +1,6 @@
 services:
   # 主服务实例 1（开启 Token 刷新）- 端口 25001
-  Kiro-Cloud-Auth-1:
+  kiro-cloud-auth-1:
     build: .
     env_file:
       - .env
@@ -106,15 +106,15 @@ services:
 
   # Nginx 负载均衡入口 - 端口 25000
   # 注意：nginx 配置文件由 run-docker.sh 根据 ENABLE_SERVICE_2 开关动态选择
-  # - 单实例模式：使用 nginx.conf.active（从 nginx-single.conf 复制）
+  # - 单实例模式：使用 nginx.active.conf（从 nginx-single.conf 复制）
   # - 双实例模式：使用 nginx.conf
   nginx:
     image: nginx:alpine
     network_mode: host
     volumes:
-      - ./nginx.conf.active:/etc/nginx/nginx.conf:ro
+      - ./nginx.active.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - Kiro-Cloud-Auth-1
+      - kiro-cloud-auth-1
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:25000/api/health"]

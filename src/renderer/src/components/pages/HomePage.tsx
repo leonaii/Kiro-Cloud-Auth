@@ -6,8 +6,8 @@ import kiroLogo from '@/assets/icon.png'
 import { cn } from '@/lib/utils'
 
 // 订阅类型颜色映射
-const getSubscriptionColor = (type: string, title?: string): string => {
-  const text = (title || type).toUpperCase()
+const getSubscriptionColor = (type?: string | null, title?: string | null): string => {
+  const text = (title || type || '').toUpperCase()
   // KIRO PRO+ / PRO_PLUS - 紫色
   if (text.includes('PRO+') || text.includes('PRO_PLUS') || text.includes('PROPLUS')) return 'bg-purple-500'
   // KIRO POWER - 金色

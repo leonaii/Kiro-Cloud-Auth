@@ -33,7 +33,7 @@ const TOKEN_REFRESH_MAX_BEFORE_EXPIRY = 16 * 60 * 1000 // 最多提前 16 分钟
 const CHECK_INTERVAL = 1 * 60 * 1000 // 每 5 分钟检查一次
 const BATCH_SIZE = 3 // 每批最多刷新 5 个账号
 const DEFAULT_EXPIRES_IN = 50 * 60 // 默认过期时间 50 分钟（秒）
-const MIN_EXPIRES_IN = 30 * 60 // 最小合理过期时间 30 分钟（秒）
+const MIN_EXPIRES_IN = 5 * 60 // 最小合理过期时间 5 分钟（秒）- 降低阈值避免不必要的重试
 const MAX_EXPIRES_IN = 2 * 60 * 60 // 最大合理过期时间 2 小时（秒）
 
 const MIN_DELAY_MS = 500 // 最小延迟 1 秒
@@ -72,9 +72,10 @@ const RefreshErrorType = {
 }
 
 class TokenRefresher {
-  constructor(pool, systemLogger = null) {
+  constructor(pool, systemLogger = null, accountPool = null) {
     this.pool = pool
     this.systemLogger = systemLogger
+    this.accountPool = accountPool // 账号池引用，用于获取活跃池账号
     this.timer = null
     this.isRefreshing = false // 锁：防止并发刷新
     this.isShuttingDown = false // 关闭标志
@@ -87,6 +88,9 @@ class TokenRefresher {
     // 动态批量大小（根据死锁频率调整）
     this.adaptiveBatchSize = BATCH_SIZE
     this.deadlockWindow = [] // 记录最近的死锁时间戳
+
+    // 是否只刷新活跃池账号（默认启用，当 accountPool 可用时）
+    this.activePoolOnlyMode = process.env.TOKEN_REFRESH_ACTIVE_POOL_ONLY !== 'false'
 
     // 性能统计
     this.stats = {
@@ -104,7 +108,10 @@ class TokenRefresher {
       lockSkipped: 0,
       lockAcquireTime: 0,
       lockAcquireCount: 0,
-      concurrentRefreshAttempts: 0
+      concurrentRefreshAttempts: 0,
+      // 活跃池模式统计
+      activePoolRefreshes: 0,
+      skippedNonActivePool: 0
     }
 
     // 性能指标滑动窗口（用于计算P95等）
@@ -118,6 +125,15 @@ class TokenRefresher {
     // 最慢刷新记录
     this.slowestRefreshes = [] // { accountId, email, durationMs, timestamp }
     this.maxSlowestRefreshes = 10
+  }
+
+  /**
+   * 设置账号池引用
+   * @param {AccountPool} accountPool - 账号池实例
+   */
+  setAccountPool(accountPool) {
+    this.accountPool = accountPool
+    console.log(`[TokenRefresher] AccountPool reference set, activePoolOnlyMode: ${this.activePoolOnlyMode}`)
   }
 
   /**
@@ -136,6 +152,9 @@ class TokenRefresher {
       timeUntilNextCheck: this.nextCheckTime ? Math.max(0, this.nextCheckTime - now) : null,
       // 重试队列信息
       retryQueueSize: this.retryQueue.size,
+      // 活跃池模式信息
+      activePoolOnlyMode: this.activePoolOnlyMode,
+      activePoolAvailable: this.accountPool?.activePoolConfig?.enabled && this.accountPool?.activePoolInitialized,
       // 性能统计
       stats: { ...this.stats }
     }
@@ -153,10 +172,11 @@ class TokenRefresher {
    * 校验 expiresIn 值并返回处理结果
    *
    * 返回值：
-   * - { status: 'valid', value: number } - 值合理，直接使用
+   * - { status: 'valid', value: number } - 值合理，直接使用（包括短过期时间）
    * - { status: 'use_default', value: number } - 值超出最大范围，使用默认值
-   * - { status: 'need_retry' } - 值小于最小合理时间但大于0，需要立即重试刷新
    * - { status: 'invalid' } - 值非数字或 ≤0，标记账号异常
+   *
+   * 注意：之前的 'need_retry' 状态已移除，短过期时间现在直接使用返回值
    */
   validateExpiresIn(expiresIn, email) {
     // 检查是否为有效数字
@@ -171,10 +191,11 @@ class TokenRefresher {
       return { status: 'invalid' }
     }
 
-    // 检查是否小于最小合理时间（但大于0）- 需要立即重试
+    // 检查是否小于最小合理时间（但大于0）- 使用返回值但记录警告
+    // 注意：之前这里会触发 need_retry 导致双重刷新，现在改为直接使用返回值
     if (expiresIn < MIN_EXPIRES_IN) {
-      console.warn(`[TokenRefresher] expiresIn too short for ${email}: ${expiresIn}s (min: ${MIN_EXPIRES_IN}s), will retry refresh`)
-      return { status: 'need_retry' }
+      console.warn(`[TokenRefresher] expiresIn short for ${email}: ${expiresIn}s (min recommended: ${MIN_EXPIRES_IN}s), using returned value`)
+      return { status: 'valid', value: expiresIn }
     }
 
     // 检查是否超出最大范围 - 使用默认值
@@ -871,118 +892,60 @@ class TokenRefresher {
         return { success: false, error: `Invalid expiresIn: ${result.expiresIn}` }
       }
 
-      if (expiresValidation.status === 'need_retry') {
-        // 小于最小合理时间但大于0：立即重新刷新一次
-        console.log(`[TokenRefresher] expiresIn too short (${result.expiresIn}s), retrying refresh for ${email}...`)
+      // 正常情况：valid 或 use_default（注：need_retry 逻辑已移除，短过期时间直接使用返回值）
+      const finalExpiresIn = expiresValidation.value
+      const newExpiresAt = now + finalExpiresIn * 1000
 
-        // 先保存当前获取的 token（使用返回的短过期时间）
-        const shortExpiresAt = Date.now() + result.expiresIn * 1000
-        await conn.query(
-          'UPDATE accounts SET cred_access_token = ?, cred_refresh_token = ?, cred_expires_at = ? WHERE id = ?',
-          [result.accessToken, result.refreshToken || cred_refresh_token, shortExpiresAt, id]
-        )
+      // 使用带重试的数据库更新
+      const [updateResult] = await this.executeWithRetry(
+        conn,
+        'UPDATE accounts SET cred_access_token = ?, cred_refresh_token = ?, cred_expires_at = ?, status = ?, last_checked_at = ? WHERE id = ?',
+        [result.accessToken, result.refreshToken || cred_refresh_token, newExpiresAt, 'active', now, id],
+        `update_token_${email}`
+      )
+      stepTimings.dbUpdate = Date.now() - dbUpdateStartTime
 
-        // 等待 1 秒后重试
-        await this.sleep(MIN_DELAY_MS)
+      // 如果有死锁重试成功，记录统计
+      if (this.stats.databaseRetries > 0) {
+        this.stats.deadlockRecovered++
+      }
 
-        // 使用新的 refreshToken 重新刷新
-        const newRefreshToken = result.refreshToken || cred_refresh_token
-        let retryResult
-        if (cred_auth_method === 'social') {
-          retryResult = await this.refreshSocialToken(newRefreshToken, cred_provider, machineId, id, email)
-        } else {
-          retryResult = await this.refreshOidcToken(newRefreshToken, cred_client_id, cred_client_secret, cred_region, machineId, id, email)
-        }
+      console.log(`[TokenRefresher] ✓ Refreshed token for ${email}, expires at ${new Date(newExpiresAt).toISOString()}, affectedRows: ${updateResult.affectedRows}`)
 
-        if (retryResult.success) {
-          const retryValidation = this.validateExpiresIn(retryResult.expiresIn, email)
-          // 重试后仍然不合理，使用默认值
-          const finalExpiresIn = (retryValidation.status === 'valid' || retryValidation.status === 'use_default')
-            ? (retryValidation.value || DEFAULT_EXPIRES_IN)
-            : DEFAULT_EXPIRES_IN
-          const retryExpiresAt = Date.now() + finalExpiresIn * 1000
-
-          await conn.query(
-            'UPDATE accounts SET cred_access_token = ?, cred_refresh_token = ?, cred_expires_at = ?, status = ?, last_checked_at = ? WHERE id = ?',
-            [retryResult.accessToken, retryResult.refreshToken || newRefreshToken, retryExpiresAt, 'active', Date.now(), id]
-          )
-          console.log(`[TokenRefresher] ✓ Retry successful for ${email}, expires at ${new Date(retryExpiresAt).toISOString()}`)
-
-          if (this.systemLogger) {
-            await this.systemLogger.logTokenRefresh({
-              accountId: id,
-              accountEmail: email,
-              accountIdp,
-              success: true,
-              message: `Token 重试刷新成功，有效期至 ${new Date(retryExpiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
-              details: { expiresAt: retryExpiresAt, authMethod: cred_auth_method, wasRetry: true, originalExpiresIn: result.expiresIn, durationMs }
-            })
+      // 记录成功日志和性能指标
+      if (this.systemLogger) {
+        await this.systemLogger.logTokenRefresh({
+          accountId: id,
+          accountEmail: email,
+          accountIdp,
+          success: true,
+          message: `Token 刷新成功，有效期至 ${new Date(newExpiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
+          durationMs,
+          details: {
+            expiresAt: newExpiresAt,
+            authMethod: cred_auth_method,
+            usedDefault: expiresValidation.status === 'use_default',
+            stepTimings
           }
-          result = retryResult // 更新 result 用于后续获取使用量
-        } else {
-          console.warn(`[TokenRefresher] Retry failed for ${email}: ${retryResult.error}, using short expiry`)
-          if (this.systemLogger) {
-            await this.systemLogger.logTokenRefresh({
-              accountId: id,
-              accountEmail: email,
-              accountIdp,
-              success: true,
-              message: `Token 刷新成功但过期时间较短 (${result.expiresIn}s)，重试失败: ${retryResult.error}`,
-              details: { expiresAt: shortExpiresAt, authMethod: cred_auth_method, retryError: retryResult.error, durationMs }
-            })
-          }
-        }
-      } else {
-        // 正常情况：valid 或 use_default
-          const finalExpiresIn = expiresValidation.value
-          const newExpiresAt = now + finalExpiresIn * 1000
+        })
 
-          // 使用带重试的数据库更新
-          const [updateResult] = await this.executeWithRetry(
-            conn,
-            'UPDATE accounts SET cred_access_token = ?, cred_refresh_token = ?, cred_expires_at = ?, status = ?, last_checked_at = ? WHERE id = ?',
-            [result.accessToken, result.refreshToken || cred_refresh_token, newExpiresAt, 'active', now, id],
-            `update_token_${email}`
-          )
-          stepTimings.dbUpdate = Date.now() - dbUpdateStartTime
-
-          // 如果有死锁重试成功，记录统计
-          if (this.stats.databaseRetries > 0) {
-            this.stats.deadlockRecovered++
-          }
-
-          console.log(`[TokenRefresher] ✓ Refreshed token for ${email}, expires at ${new Date(newExpiresAt).toISOString()}, affectedRows: ${updateResult.affectedRows}`)
-
-        // 记录成功日志和性能指标
-        if (this.systemLogger) {
-          await this.systemLogger.logTokenRefresh({
+        // 记录性能指标
+        await this.systemLogger.logPerformance({
+          operation: 'token_refresh',
+          durationMs,
+          success: true,
+          details: {
             accountId: id,
             accountEmail: email,
-            accountIdp,
-            success: true,
-            message: `Token 刷新成功，有效期至 ${new Date(newExpiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
-            durationMs,
-            details: {
-              expiresAt: newExpiresAt,
-              authMethod: cred_auth_method,
-              usedDefault: expiresValidation.status === 'use_default',
-              stepTimings
-            }
-          })
+            authMethod: cred_auth_method,
+            stepTimings
+          }
+        }).catch(() => {})
+      }
 
-          // 记录性能指标
-          await this.systemLogger.logPerformance({
-            operation: 'token_refresh',
-            durationMs,
-            success: true,
-            details: {
-              accountId: id,
-              accountEmail: email,
-              authMethod: cred_auth_method,
-              stepTimings
-            }
-          }).catch(() => {})
-        }
+      // 刷新活跃池中的账号信息
+      if (this.accountPool?.activePoolConfig?.enabled) {
+        await this.accountPool.refreshActivePoolAccount(id)
       }
 
       // 如果启用了自动刷新使用量，在 token 刷新成功后获取使用量
@@ -1186,26 +1149,72 @@ class TokenRefresher {
       // 使用自适应批量大小
       const effectiveBatchSize = this.adaptiveBatchSize
 
-      // 查找即将过期的账号，限制每批最多 effectiveBatchSize 个
-      // 排除已删除的账号（is_del = TRUE）
-      const [rows] = await this.executeWithRetry(
-        conn,
-        `SELECT id, email, idp, cred_access_token, cred_refresh_token,
-                cred_client_id, cred_client_secret, cred_region,
-                cred_expires_at, cred_auth_method, cred_provider
-         FROM accounts
-         WHERE cred_expires_at IS NOT NULL
-           AND cred_refresh_token IS NOT NULL
-           AND cred_refresh_token != ''
-           AND cred_expires_at < ?
-           AND cred_expires_at > ?
-           AND status != 'error'
-           AND (is_del = FALSE OR is_del IS NULL)
-         ORDER BY cred_expires_at ASC
-         LIMIT ?`,
-        [threshold, now, effectiveBatchSize - retryAccounts.length],
-        'query_expiring_accounts'
-      )
+      // 检查是否启用活跃池模式
+      const useActivePoolMode = this.activePoolOnlyMode &&
+        this.accountPool?.activePoolConfig?.enabled &&
+        this.accountPool?.activePoolInitialized
+
+      let rows = []
+
+      if (useActivePoolMode) {
+        // 活跃池模式：只刷新活跃池中的账号
+        const activePoolAccountIds = this.accountPool.getActivePoolAccountIds()
+
+        if (activePoolAccountIds.length === 0) {
+          console.log('[TokenRefresher] Active pool is empty, no accounts to refresh')
+        } else {
+          // 构建 IN 子句的占位符
+          const placeholders = activePoolAccountIds.map(() => '?').join(',')
+
+          const [activeRows] = await this.executeWithRetry(
+            conn,
+            `SELECT id, email, idp, cred_access_token, cred_refresh_token,
+                    cred_client_id, cred_client_secret, cred_region,
+                    cred_expires_at, cred_auth_method, cred_provider
+             FROM accounts
+             WHERE id IN (${placeholders})
+               AND cred_expires_at IS NOT NULL
+               AND cred_refresh_token IS NOT NULL
+               AND cred_refresh_token != ''
+               AND cred_expires_at < ?
+               AND cred_expires_at > ?
+               AND status != 'error'
+               AND (is_del = FALSE OR is_del IS NULL)
+             ORDER BY cred_expires_at ASC
+             LIMIT ?`,
+            [...activePoolAccountIds, threshold, now, effectiveBatchSize - retryAccounts.length],
+            'query_expiring_accounts_active_pool'
+          )
+
+          rows = activeRows
+          this.stats.activePoolRefreshes += rows.length
+
+          console.log(`[TokenRefresher] Active pool mode: found ${rows.length} accounts to refresh (pool size: ${activePoolAccountIds.length})`)
+        }
+      } else {
+        // 传统模式：查找所有即将过期的账号
+        // 排除已删除的账号（is_del = TRUE）
+        const [allRows] = await this.executeWithRetry(
+          conn,
+          `SELECT id, email, idp, cred_access_token, cred_refresh_token,
+                  cred_client_id, cred_client_secret, cred_region,
+                  cred_expires_at, cred_auth_method, cred_provider
+           FROM accounts
+           WHERE cred_expires_at IS NOT NULL
+             AND cred_refresh_token IS NOT NULL
+             AND cred_refresh_token != ''
+             AND cred_expires_at < ?
+             AND cred_expires_at > ?
+             AND status != 'error'
+             AND (is_del = FALSE OR is_del IS NULL)
+           ORDER BY cred_expires_at ASC
+           LIMIT ?`,
+          [threshold, now, effectiveBatchSize - retryAccounts.length],
+          'query_expiring_accounts'
+        )
+
+        rows = allRows
+      }
 
       // 合并重试账号和新账号
       const allAccounts = [...retryAccounts, ...rows]

@@ -75,10 +75,10 @@ use_pro() {
 setup_nginx_config() {
     if [ "$ENABLE_SERVICE_2" = "true" ]; then
         echo -e "${CYAN}[NGINX] Using dual-instance config (nginx.conf)${NC}"
-        cp nginx.conf nginx.conf.active
+        cp nginx.conf nginx.active.conf
     else
         echo -e "${CYAN}[NGINX] Using single-instance config (nginx-single.conf)${NC}"
-        cp nginx-single.conf nginx.conf.active
+        cp nginx-single.conf nginx.active.conf
     fi
 }
 
@@ -199,7 +199,7 @@ do_deploy_blue_green() {
         docker-compose --profile blue-green stop $SERVICE_BLUE 2>/dev/null || true
         exit 1
     fi
-    cp nginx-blue.conf nginx.conf.active
+    cp nginx-blue.conf nginx.active.conf
     docker-compose exec -T $NGINX_SERVICE nginx -s reload 2>/dev/null || {
         echo -e "${YELLOW}[WARN] Nginx reload failed, recreating...${NC}"
         docker-compose up -d --no-deps --force-recreate $NGINX_SERVICE
@@ -253,7 +253,7 @@ do_deploy_blue_green() {
         echo -e "${YELLOW}[WARN] Keeping blue instance as primary${NC}"
         return 1
     fi
-    cp nginx-single.conf nginx.conf.active
+    cp nginx-single.conf nginx.active.conf
     docker-compose exec -T $NGINX_SERVICE nginx -s reload 2>/dev/null || {
         echo -e "${YELLOW}[WARN] Nginx reload failed, recreating...${NC}"
         docker-compose up -d --no-deps --force-recreate $NGINX_SERVICE
@@ -549,7 +549,7 @@ do_scale_single() {
     echo -e "${YELLOW}[SCALE] Switching to single instance mode...${NC}"
 
     # 切换 nginx 配置
-    cp nginx-single.conf nginx.conf.active
+    cp nginx-single.conf nginx.active.conf
     echo -e "${CYAN}[NGINX] Switched to single-instance config${NC}"
 
     # 停止实例 2
@@ -567,7 +567,7 @@ do_scale_double() {
     echo -e "${YELLOW}[SCALE] Switching to double instance mode...${NC}"
 
     # 切换 nginx 配置
-    cp nginx.conf nginx.conf.active
+    cp nginx.conf nginx.active.conf
     echo -e "${CYAN}[NGINX] Switched to dual-instance config${NC}"
 
     # 启动实例 2
