@@ -1206,14 +1206,9 @@ class KiroClient {
     let buffer = ''
 
     // Thinking 模式状态跟踪
-    let inThinkingBlock = false
-    let thinkingBuffer = ''
-    let contentBuffer = ''
-    
-    // 工具调用状态跟踪
-    let currentToolCall = null
-    let totalContent = ''
-    let lastContentEvent = null // 用于检测连续重复的 content 事件
+    let inThinkingBlock = false;
+    let thinkingBuffer = '';
+    let contentBuffer = '';
 
     try {
       while (true) {
@@ -1222,144 +1217,124 @@ class KiroClient {
 
         buffer += decoder.decode(value, { stream: true })
 
-        // 解析 AWS Event Stream 格式的事件（参照 claude-kiro.js 的 parseAwsEventStreamBuffer）
-        const { events, remaining } = this.parseAwsEventStreamBuffer(buffer)
-        buffer = remaining
+        // 解析 buffer 中所有完整的 {"content":"..."} 对象
+        const startMarker = '{"content":"'
+        let pos = 0
+        let lastProcessedEnd = 0
 
-        // 处理所有解析出的事件
-        for (const event of events) {
-          if (event.type === 'content' && event.data) {
-            // 检查是否与上一个 content 事件完全相同（Kiro API 有时会重复发送）
-            if (lastContentEvent === event.data) {
-              continue
-            }
-            lastContentEvent = event.data
-            totalContent += event.data
+        while (pos < buffer.length) {
+          const startIdx = buffer.indexOf(startMarker, pos)
+          if (startIdx === -1) break
 
-            // 如果启用了 thinking 模式，处理 thinking 标签
-            if (thinkingEnabled) {
-              let remaining = event.data
+          const contentStart = startIdx + startMarker.length
 
-              while (remaining.length > 0) {
-                if (!inThinkingBlock) {
-                  // 不在 thinking 块中，查找开始标签
-                  const thinkStartIdx = findRealTag(remaining, THINKING_START_TAG)
-                  if (thinkStartIdx === -1) {
-                    // 没有开始标签，全部是普通内容
-                    contentBuffer += remaining
-                    if (contentBuffer.length > 0) {
-                      yield { type: 'content', content: contentBuffer }
-                      contentBuffer = ''
-                    }
-                    remaining = ''
-                  } else {
-                    // 找到开始标签
-                    if (thinkStartIdx > 0) {
-                      const beforeTag = remaining.substring(0, thinkStartIdx)
-                      yield { type: 'content', content: beforeTag }
-                    }
-                    inThinkingBlock = true
-                    remaining = remaining.substring(thinkStartIdx + THINKING_START_TAG.length)
-                    yield { type: 'thinking_start' }
-                  }
-                } else {
-                  // 在 thinking 块中，查找结束标签
-                  const thinkEndIdx = findRealTag(remaining, THINKING_END_TAG)
-                  if (thinkEndIdx === -1) {
-                    // 没有结束标签，全部是 thinking 内容
-                    thinkingBuffer += remaining
-                    yield { type: 'thinking', thinking: remaining }
-                    remaining = ''
-                  } else {
-                    // 找到结束标签
-                    if (thinkEndIdx > 0) {
-                      const thinkContent = remaining.substring(0, thinkEndIdx)
-                      thinkingBuffer += thinkContent
-                      yield { type: 'thinking', thinking: thinkContent }
-                    }
-                    inThinkingBlock = false
-                    yield { type: 'thinking_end', thinking: thinkingBuffer }
-                    thinkingBuffer = ''
-                    remaining = remaining.substring(thinkEndIdx + THINKING_END_TAG.length)
-                  }
-                }
+          // 找到字符串结束的位置
+          let contentEnd = contentStart
+          let foundEnd = false
+          while (contentEnd < buffer.length) {
+            if (buffer[contentEnd] === '"') {
+              // 检查是否是转义的引号
+              let backslashCount = 0
+              let checkPos = contentEnd - 1
+              while (checkPos >= contentStart && buffer[checkPos] === '\\') {
+                backslashCount++
+                checkPos--
               }
-            } else {
-              // 未启用 thinking 模式，直接输出
-              yield { type: 'content', content: event.data }
-            }
-          } else if (event.type === 'toolUse') {
-            // 工具调用事件（包含 name 和 toolUseId）
-            const tc = event.data
-            if (tc.name && tc.toolUseId) {
-              // 检查是否是同一个工具调用的续传
-              if (currentToolCall && currentToolCall.toolUseId === tc.toolUseId) {
-                currentToolCall.input += tc.input || ''
-              } else {
-                // 不同的工具调用，先保存之前的
-                if (currentToolCall) {
-                  yield { type: 'toolUse', toolUse: currentToolCall }
-                }
-                currentToolCall = {
-                  toolUseId: tc.toolUseId,
-                  name: tc.name,
-                  input: tc.input || ''
-                }
-              }
-              // 如果这个事件包含 stop，完成工具调用
-              if (tc.stop) {
-                yield { type: 'toolUse', toolUse: currentToolCall }
-                currentToolCall = null
+              // 偶数个反斜杠意味着引号没有被转义
+              if (backslashCount % 2 === 0) {
+                foundEnd = true
+                break
               }
             }
-          } else if (event.type === 'toolUseInput') {
-            // 工具调用的 input 续传事件
-            if (currentToolCall) {
-              currentToolCall.input += event.data.input || ''
-            }
-          } else if (event.type === 'toolUseStop') {
-            // 工具调用结束事件
-            if (currentToolCall && event.data.stop) {
-              yield { type: 'toolUse', toolUse: currentToolCall }
-              currentToolCall = null
-            }
-          } else if (event.type === 'contextUsage') {
-            // 上下文使用百分比事件
-            yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage }
+            contentEnd++
           }
-        }
-      }
 
-      // 处理未完成的工具调用
-      if (currentToolCall) {
-        yield { type: 'toolUse', toolUse: currentToolCall }
-        currentToolCall = null
+          if (!foundEnd) {
+            // 没找到结束引号，保留这部分到下次处理
+            break
+          }
+
+          const jsonStr = buffer.substring(startIdx, contentEnd + 2) // 包含 "}
+          try {
+            const parsed = JSON.parse(jsonStr)
+            if (parsed.content) {
+              const chunk = parsed.content;
+
+              // 如果启用了 thinking 模式，处理 thinking 标签
+              if (thinkingEnabled) {
+                // 将 chunk 添加到适当的缓冲区并检测标签
+                let remaining = chunk;
+
+                while (remaining.length > 0) {
+                  if (!inThinkingBlock) {
+                    // 不在 thinking 块中，查找开始标签
+                    const thinkStartIdx = remaining.indexOf(THINKING_START_TAG);
+                    if (thinkStartIdx === -1) {
+                      // 没有开始标签，全部是普通内容
+                      contentBuffer += remaining;
+                      if (contentBuffer.length > 0) {
+                        yield { type: 'content', content: contentBuffer };
+                        contentBuffer = '';
+                      }
+                      remaining = '';
+                    } else {
+                      // 找到开始标签
+                      if (thinkStartIdx > 0) {
+                        // 标签前有内容
+                        const beforeTag = remaining.substring(0, thinkStartIdx);
+                        yield { type: 'content', content: beforeTag };
+                      }
+                      inThinkingBlock = true;
+                      remaining = remaining.substring(thinkStartIdx + THINKING_START_TAG.length);
+                      // 发送 thinking 开始事件
+                      yield { type: 'thinking_start' };
+                    }
+                  } else {
+                    // 在 thinking 块中，查找结束标签
+                    const thinkEndIdx = remaining.indexOf(THINKING_END_TAG);
+                    if (thinkEndIdx === -1) {
+                      // 没有结束标签，全部是 thinking 内容
+                      thinkingBuffer += remaining;
+                      yield { type: 'thinking', thinking: remaining };
+                      remaining = '';
+                    } else {
+                      // 找到结束标签
+                      if (thinkEndIdx > 0) {
+                        const thinkContent = remaining.substring(0, thinkEndIdx);
+                        thinkingBuffer += thinkContent;
+                        yield { type: 'thinking', thinking: thinkContent };
+                      }
+                      inThinkingBlock = false;
+                      // 发送 thinking 结束事件
+                      yield { type: 'thinking_end', thinking: thinkingBuffer };
+                      thinkingBuffer = '';
+                      remaining = remaining.substring(thinkEndIdx + THINKING_END_TAG.length);
+                    }
+                  }
+                }
+              } else {
+                // 未启用 thinking 模式，直接输出
+                yield { type: 'content', content: chunk }
+              }
+            }
+          } catch (e) {
+            // JSON 解析失败时，记录错误但继续处理
+            console.warn('[KiroClient] Stream JSON parse failed:', e.message)
+          }
+
+          lastProcessedEnd = contentEnd + 2
+          pos = lastProcessedEnd
+        }
+
+        // 保留未处理的部分
+        if (lastProcessedEnd > 0) {
+          buffer = buffer.substring(lastProcessedEnd)
+        }
       }
 
       // 处理流结束时可能残留的内容
       if (thinkingEnabled && contentBuffer.length > 0) {
-        yield { type: 'content', content: contentBuffer }
-      }
-
-      // 检查文本内容中的 bracket 格式工具调用
-      const bracketToolCalls = parseBracketToolCalls(totalContent)
-      if (bracketToolCalls && bracketToolCalls.length > 0) {
-        for (const btc of bracketToolCalls) {
-          let input = {}
-          try {
-            input = JSON.parse(btc.function.arguments || '{}')
-          } catch (e) {
-            // 保持原样
-          }
-          yield {
-            type: 'toolUse',
-            toolUse: {
-              toolUseId: btc.id || `tool_${uuidv4()}`,
-              name: btc.function.name,
-              input
-            }
-          }
-        }
+        yield { type: 'content', content: contentBuffer };
       }
     } finally {
       reader.releaseLock()

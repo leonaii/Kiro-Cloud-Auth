@@ -115,8 +115,30 @@ function buildOpenAIResponse(content, model, inputTokens, outputTokens, finishRe
  * @param {string} model - 模型名称
  * @param {string|null} finishReason - 结束原因
  * @param {string} deltaType - delta 类型：'content' 或 'thinking'
+ * @param {boolean} isFirst - 是否是第一个 chunk（需要包含 role）
  */
-function buildStreamChunk(content, model, finishReason = null, deltaType = 'content') {
+function buildStreamChunk(content, model, finishReason = null, deltaType = 'content', isFirst = false) {
+  let delta = {}
+  
+  if (finishReason) {
+    // 结束 chunk，delta 为空
+    delta = {}
+  } else if (isFirst) {
+    // 第一个 chunk，包含 role 和 content
+    if (deltaType === 'thinking') {
+      delta = { role: 'assistant', reasoning_content: content }
+    } else {
+      delta = { role: 'assistant', content }
+    }
+  } else {
+    // 后续 chunk，只包含 content
+    if (deltaType === 'thinking') {
+      delta = { reasoning_content: content }
+    } else {
+      delta = { content }
+    }
+  }
+  
   const chunk = {
     id: `chatcmpl-${uuidv4()}`,
     object: 'chat.completion.chunk',
@@ -125,11 +147,7 @@ function buildStreamChunk(content, model, finishReason = null, deltaType = 'cont
     choices: [
       {
         index: 0,
-        delta: finishReason ? {} : (
-          deltaType === 'thinking'
-            ? { reasoning_content: content }
-            : { content }
-        ),
+        delta,
         logprobs: null,
         finish_reason: finishReason
       }
@@ -431,19 +449,22 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       let accountSwitched = false
 
       let thinkingContent = ''  // 累积 thinking 内容
+      let isFirstChunk = true   // 跟踪是否是第一个 chunk
 
       try {
         for await (const event of streamResult.stream) {
           if (event.type === 'content' && event.content) {
             fullContent += event.content
-            res.write(buildStreamChunk(event.content, model))
+            res.write(buildStreamChunk(event.content, model, null, 'content', isFirstChunk))
+            isFirstChunk = false
           } else if (event.type === 'thinking_start') {
             // Thinking 开始，可选：发送空的 thinking chunk 作为开始标记
             // 这里不发送任何内容，等待实际的 thinking 内容
           } else if (event.type === 'thinking' && event.thinking) {
             // 发送 thinking 内容片段
             thinkingContent += event.thinking
-            res.write(buildStreamChunk(event.thinking, model, null, 'thinking'))
+            res.write(buildStreamChunk(event.thinking, model, null, 'thinking', isFirstChunk))
+            isFirstChunk = false
           } else if (event.type === 'thinking_end') {
             // Thinking 结束，可选：发送结束标记
             // 这里不发送额外内容，thinking 内容已经通过 thinking 事件发送
@@ -519,13 +540,16 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
               // 重新处理新流
               thinkingContent = ''  // 重置 thinking 内容
+              let isFirstChunkRetry = true  // 重试时也需要跟踪第一个 chunk
               for await (const event of newStream) {
                 if (event.type === 'content' && event.content) {
                   fullContent += event.content
-                  res.write(buildStreamChunk(event.content, model))
+                  res.write(buildStreamChunk(event.content, model, null, 'content', isFirstChunkRetry))
+                  isFirstChunkRetry = false
                 } else if (event.type === 'thinking' && event.thinking) {
                   thinkingContent += event.thinking
-                  res.write(buildStreamChunk(event.thinking, model, null, 'thinking'))
+                  res.write(buildStreamChunk(event.thinking, model, null, 'thinking', isFirstChunkRetry))
+                  isFirstChunkRetry = false
                 } else if (event.type === 'token_refreshed' && event.newTokens) {
                   const expiresAt = Date.now() + (event.newTokens.expiresIn || 3600) * 1000
                   await accountPool.updateAccountToken(
