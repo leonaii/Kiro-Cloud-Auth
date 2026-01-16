@@ -258,7 +258,7 @@ class KiroClient {
   }
 
   /**
-   * 构建 Kiro 请求
+   * 构建 Kiro 请求（参照 claude-kiro.js 的 buildCodewhispererRequest 实现）
    * @param {Array} messages - 消息列表
    * @param {string} model - 模型名称
    * @param {Array} tools - 工具列表
@@ -272,20 +272,44 @@ class KiroClient {
     // 检查 thinking 模式
     const { enabled: thinkingEnabled, budgetTokens } = checkThinkingMode(requestBody || {});
 
-    // 处理消息
-    const processedMessages = [...messages]
+    // 处理消息 - 深拷贝以避免修改原始数据
+    const processedMessages = messages.map(msg => ({
+      role: msg.role,
+      content: Array.isArray(msg.content) ? [...msg.content] : msg.content
+    }))
+
+    // 判断最后一条消息是否为 assistant，如果是且内容为 "{" 则移除
+    if (processedMessages.length > 0) {
+      const lastMessage = processedMessages[processedMessages.length - 1]
+      if (lastMessage.role === 'assistant') {
+        const content = Array.isArray(lastMessage.content) ? lastMessage.content : [{ type: 'text', text: lastMessage.content }]
+        if (content.length > 0 && content[0].type === 'text' && content[0].text === '{') {
+          console.log('[KiroClient] Removing last assistant with "{" message')
+          processedMessages.pop()
+        }
+      }
+    }
 
     // 合并相邻相同 role 的消息
     const mergedMessages = []
     for (const msg of processedMessages) {
       if (mergedMessages.length === 0) {
-        mergedMessages.push({ ...msg })
+        mergedMessages.push({ ...msg, content: Array.isArray(msg.content) ? [...msg.content] : msg.content })
       } else {
         const last = mergedMessages[mergedMessages.length - 1]
         if (msg.role === last.role) {
-          last.content = this.mergeContent(last.content, msg.content)
+          // 合并消息内容
+          if (Array.isArray(last.content) && Array.isArray(msg.content)) {
+            last.content.push(...msg.content)
+          } else if (typeof last.content === 'string' && typeof msg.content === 'string') {
+            last.content += '\n' + msg.content
+          } else if (Array.isArray(last.content) && typeof msg.content === 'string') {
+            last.content.push({ type: 'text', text: msg.content })
+          } else if (typeof last.content === 'string' && Array.isArray(msg.content)) {
+            last.content = [{ type: 'text', text: last.content }, ...msg.content]
+          }
         } else {
-          mergedMessages.push({ ...msg })
+          mergedMessages.push({ ...msg, content: Array.isArray(msg.content) ? [...msg.content] : msg.content })
         }
       }
     }
@@ -294,20 +318,25 @@ class KiroClient {
     let startIndex = 0
 
     // 处理 system prompt，如果启用了 thinking 模式则注入提示
-    let finalSystemPrompt = systemPrompt;
+    let finalSystemPrompt = systemPrompt ? this.getContentText(systemPrompt) : null;
     if (thinkingEnabled) {
-      const thinkingHint = `<thinking_mode>interleaved</thinking_mode><max_thinking_length>${budgetTokens}</max_thinking_length>`;
-      finalSystemPrompt = finalSystemPrompt ? finalSystemPrompt + '\n' + thinkingHint : thinkingHint;
+      // 使用 enabled 模式（与 claude-kiro.js 一致）
+      const thinkingHint = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budgetTokens}</max_thinking_length>`;
+      if (!finalSystemPrompt) {
+        finalSystemPrompt = thinkingHint;
+      } else if (!finalSystemPrompt.includes('<thinking_mode>')) {
+        finalSystemPrompt = thinkingHint + '\n' + finalSystemPrompt;
+      }
       console.log(`[KiroClient] Thinking mode enabled, budget_tokens: ${budgetTokens}`);
     }
 
+    // 处理 system prompt
     if (finalSystemPrompt) {
-      const systemText = this.getContentText(finalSystemPrompt)
       if (mergedMessages[0]?.role === 'user') {
-        const firstContent = this.getContentText(mergedMessages[0])
+        const firstUserContent = this.getContentText(mergedMessages[0])
         history.push({
           userInputMessage: {
-            content: `${systemText}\n\n${firstContent}`,
+            content: `${finalSystemPrompt}\n\n${firstUserContent}`,
             modelId: kiroModel,
             origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
           }
@@ -316,7 +345,7 @@ class KiroClient {
       } else {
         history.push({
           userInputMessage: {
-            content: systemText,
+            content: finalSystemPrompt,
             modelId: kiroModel,
             origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
           }
@@ -324,61 +353,363 @@ class KiroClient {
       }
     }
 
-    // 构建历史消息
+    // 保留最近 5 条历史消息中的图片
+    const keepImageThreshold = 5
+
+    // 构建历史消息（不包括最后一条）
     for (let i = startIndex; i < mergedMessages.length - 1; i++) {
       const msg = mergedMessages[i]
+      const distanceFromEnd = (mergedMessages.length - 1) - i
+      const shouldKeepImages = distanceFromEnd <= keepImageThreshold
+
       if (msg.role === 'user') {
-        history.push({
-          userInputMessage: {
-            content: this.getContentText(msg),
-            modelId: kiroModel,
-            origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
-          }
-        })
+        const userInputMessage = this.buildUserInputMessage(msg, kiroModel, shouldKeepImages)
+        history.push({ userInputMessage })
       } else if (msg.role === 'assistant') {
-        history.push({
-          assistantResponseMessage: { content: this.getContentText(msg) }
-        })
+        const assistantResponseMessage = this.buildAssistantResponseMessage(msg)
+        history.push({ assistantResponseMessage })
       }
     }
 
-    // 当前消息
-    const currentMsg = mergedMessages[mergedMessages.length - 1]
-    let currentContent = this.getContentText(currentMsg)
-    if (!currentContent) currentContent = 'Continue'
+    // 处理当前消息（最后一条）
+    let currentMessage = mergedMessages[mergedMessages.length - 1]
+    let currentContent = ''
+    let currentToolResults = []
+    let currentImages = []
 
+    // 如果最后一条消息是 assistant，需要将其加入 history，然后创建一个 user 类型的 currentMessage
+    if (currentMessage && currentMessage.role === 'assistant') {
+      console.log('[KiroClient] Last message is assistant, moving it to history and creating user currentMessage')
+      
+      const assistantResponseMessage = this.buildAssistantResponseMessage(currentMessage)
+      history.push({ assistantResponseMessage })
+      
+      // 设置 currentContent 为 "Continue"
+      currentContent = 'Continue'
+    } else if (currentMessage) {
+      // 最后一条消息是 user，需要确保 history 最后一个元素是 assistantResponseMessage
+      if (history.length > 0) {
+        const lastHistoryItem = history[history.length - 1]
+        if (!lastHistoryItem.assistantResponseMessage) {
+          console.log('[KiroClient] History does not end with assistantResponseMessage, adding empty one')
+          history.push({
+            assistantResponseMessage: {
+              content: 'Continue'
+            }
+          })
+        }
+      }
+
+      // 处理 user 消息（支持 OpenAI 和 Claude 两种格式）
+      const content = currentMessage.content
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part.type === 'text') {
+            currentContent += part.text || ''
+          } else if (part.type === 'tool_result') {
+            // Claude 格式的工具结果
+            currentToolResults.push({
+              content: [{ text: this.getContentText(part.content) }],
+              status: part.is_error ? 'error' : 'success',
+              toolUseId: part.tool_use_id
+            })
+          } else if (part.type === 'image' && part.source) {
+            // Claude 格式的图片
+            currentImages.push({
+              format: part.source.media_type?.split('/')[1] || 'png',
+              source: {
+                bytes: part.source.data
+              }
+            })
+          } else if (part.type === 'image_url' && part.image_url) {
+            // OpenAI 格式的图片
+            const imageUrl = part.image_url.url || ''
+            if (imageUrl.startsWith('data:')) {
+              // Base64 格式: data:image/png;base64,xxxxx
+              const matches = imageUrl.match(/^data:image\/(\w+);base64,(.+)$/)
+              if (matches) {
+                currentImages.push({
+                  format: matches[1] || 'png',
+                  source: {
+                    bytes: matches[2]
+                  }
+                })
+              }
+            }
+            // URL 格式暂不支持，需要下载图片
+          }
+        }
+      } else {
+        currentContent = this.getContentText(currentMessage)
+      }
+
+      // 处理 OpenAI 格式的工具结果（role: 'tool'）
+      // 注意：这种情况在 convertMessages 之后不会出现，因为 tool 角色会被转换
+      // 但为了兼容性，这里也处理一下
+      if (currentMessage.role === 'tool' && currentMessage.tool_call_id) {
+        currentToolResults.push({
+          content: [{ text: this.getContentText(currentMessage.content) }],
+          status: 'success',
+          toolUseId: currentMessage.tool_call_id
+        })
+        if (!currentContent) {
+          currentContent = 'Tool results provided.'
+        }
+      }
+
+      // Kiro API 要求 content 不能为空
+      if (!currentContent) {
+        currentContent = currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue'
+      }
+    } else {
+      currentContent = 'Continue'
+    }
+
+    // 构建请求
     const request = {
       conversationState: {
         chatTriggerType: KIRO_CONSTANTS.CHAT_TRIGGER_TYPE_MANUAL,
         conversationId,
-        currentMessage: {
-          userInputMessage: {
-            content: currentContent,
-            modelId: kiroModel,
-            origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
-          }
-        }
+        currentMessage: {}
       }
     }
 
+    // 只有当 history 非空时才添加
     if (history.length > 0) {
       request.conversationState.history = history
     }
 
-    // 添加工具（处理名称和描述的截断）
+    // 构建 userInputMessage
+    const userInputMessage = {
+      content: currentContent,
+      modelId: kiroModel,
+      origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
+    }
+
+    // 添加图片
+    if (currentImages.length > 0) {
+      userInputMessage.images = currentImages
+    }
+
+    // 构建 userInputMessageContext
+    const userInputMessageContext = {}
+
+    // 添加 toolResults（去重）
+    if (currentToolResults.length > 0) {
+      const uniqueToolResults = []
+      const seenToolUseIds = new Set()
+      for (const tr of currentToolResults) {
+        if (!seenToolUseIds.has(tr.toolUseId)) {
+          seenToolUseIds.add(tr.toolUseId)
+          uniqueToolResults.push(tr)
+        }
+      }
+      userInputMessageContext.toolResults = uniqueToolResults
+    }
+
+    // 添加工具（处理名称和描述的截断，过滤 web_search）
     if (tools && tools.length > 0) {
-      request.conversationState.currentMessage.userInputMessage.userInputMessageContext = {
-        tools: tools.map(tool => ({
+      const filteredTools = tools.filter(tool => {
+        const name = (tool.function?.name || tool.name || '').toLowerCase()
+        const shouldIgnore = name === 'web_search' || name === 'websearch'
+        if (shouldIgnore) {
+          console.log(`[KiroClient] Ignoring tool: ${tool.function?.name || tool.name}`)
+        }
+        return !shouldIgnore
+      })
+
+      if (filteredTools.length > 0) {
+        userInputMessageContext.tools = filteredTools.map(tool => ({
           toolSpecification: {
             name: shortenToolNameIfNeeded(tool.function?.name || tool.name),
             description: processToolDescription(tool.function?.description || tool.description || ''),
-            inputSchema: { json: tool.function?.parameters || tool.parameters || {} }
+            inputSchema: { json: tool.function?.parameters || tool.input_schema || {} }
           }
         }))
       }
     }
 
+    // 只有当 userInputMessageContext 有内容时才添加
+    if (Object.keys(userInputMessageContext).length > 0) {
+      userInputMessage.userInputMessageContext = userInputMessageContext
+    }
+
+    request.conversationState.currentMessage.userInputMessage = userInputMessage
+
+    // 如果是 social 认证，添加 profileArn
+    if (this.authMethod === 'social' && this.account.credentials?.profileArn) {
+      request.profileArn = this.account.credentials.profileArn
+    }
+
     return request
+  }
+
+  /**
+   * 构建 user 消息（用于历史记录，支持 OpenAI 和 Claude 两种格式）
+   */
+  buildUserInputMessage(msg, kiroModel, shouldKeepImages = true) {
+    const userInputMessage = {
+      content: '',
+      modelId: kiroModel,
+      origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
+    }
+    
+    let imageCount = 0
+    const toolResults = []
+    const images = []
+    const content = msg.content
+
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type === 'text') {
+          userInputMessage.content += part.text || ''
+        } else if (part.type === 'tool_result') {
+          // Claude 格式的工具结果
+          toolResults.push({
+            content: [{ text: this.getContentText(part.content) }],
+            status: part.is_error ? 'error' : 'success',
+            toolUseId: part.tool_use_id
+          })
+        } else if (part.type === 'image' && part.source) {
+          // Claude 格式的图片
+          if (shouldKeepImages) {
+            images.push({
+              format: part.source.media_type?.split('/')[1] || 'png',
+              source: {
+                bytes: part.source.data
+              }
+            })
+          } else {
+            imageCount++
+          }
+        } else if (part.type === 'image_url' && part.image_url) {
+          // OpenAI 格式的图片
+          const imageUrl = part.image_url.url || ''
+          if (imageUrl.startsWith('data:')) {
+            const matches = imageUrl.match(/^data:image\/(\w+);base64,(.+)$/)
+            if (matches) {
+              if (shouldKeepImages) {
+                images.push({
+                  format: matches[1] || 'png',
+                  source: {
+                    bytes: matches[2]
+                  }
+                })
+              } else {
+                imageCount++
+              }
+            }
+          }
+        }
+      }
+    } else {
+      userInputMessage.content = this.getContentText(msg)
+    }
+
+    // 处理 OpenAI 格式的工具结果（role: 'tool'）
+    if (msg.role === 'tool' && msg.tool_call_id) {
+      toolResults.push({
+        content: [{ text: this.getContentText(msg.content) }],
+        status: 'success',
+        toolUseId: msg.tool_call_id
+      })
+      if (!userInputMessage.content) {
+        userInputMessage.content = 'Tool results provided.'
+      }
+    }
+
+    // 添加保留的图片
+    if (images.length > 0) {
+      userInputMessage.images = images
+    }
+
+    // 添加图片占位符
+    if (imageCount > 0) {
+      const imagePlaceholder = `[此消息包含 ${imageCount} 张图片，已在历史记录中省略]`
+      userInputMessage.content = userInputMessage.content
+        ? `${userInputMessage.content}\n${imagePlaceholder}`
+        : imagePlaceholder
+    }
+
+    // 添加 toolResults（去重）
+    if (toolResults.length > 0) {
+      const uniqueToolResults = []
+      const seenIds = new Set()
+      for (const tr of toolResults) {
+        if (!seenIds.has(tr.toolUseId)) {
+          seenIds.add(tr.toolUseId)
+          uniqueToolResults.push(tr)
+        }
+      }
+      userInputMessage.userInputMessageContext = { toolResults: uniqueToolResults }
+    }
+
+    return userInputMessage
+  }
+
+  /**
+   * 构建 assistant 消息（用于历史记录，支持 OpenAI 和 Claude 两种格式）
+   */
+  buildAssistantResponseMessage(msg) {
+    const assistantResponseMessage = {
+      content: ''
+    }
+    
+    const toolUses = []
+    let thinkingText = ''
+    const content = msg.content
+
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type === 'text') {
+          assistantResponseMessage.content += part.text || ''
+        } else if (part.type === 'thinking') {
+          thinkingText += (part.thinking || part.text || '')
+        } else if (part.type === 'tool_use') {
+          // Claude 格式的工具调用
+          toolUses.push({
+            input: part.input,
+            name: part.name,
+            toolUseId: part.id
+          })
+        }
+      }
+    } else {
+      assistantResponseMessage.content = this.getContentText(msg)
+    }
+
+    // 处理 OpenAI 格式的工具调用（tool_calls 数组）
+    if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+      for (const toolCall of msg.tool_calls) {
+        if (toolCall.type === 'function' && toolCall.function) {
+          let input = {}
+          try {
+            input = JSON.parse(toolCall.function.arguments || '{}')
+          } catch (e) {
+            console.warn('[KiroClient] Failed to parse tool call arguments:', e.message)
+          }
+          toolUses.push({
+            input,
+            name: toolCall.function.name,
+            toolUseId: toolCall.id
+          })
+        }
+      }
+    }
+
+    // 将 thinking 内容包装在标签中
+    if (thinkingText) {
+      assistantResponseMessage.content = assistantResponseMessage.content
+        ? `${THINKING_START_TAG}${thinkingText}${THINKING_END_TAG}\n\n${assistantResponseMessage.content}`
+        : `${THINKING_START_TAG}${thinkingText}${THINKING_END_TAG}`
+    }
+
+    // 添加 toolUses
+    if (toolUses.length > 0) {
+      assistantResponseMessage.toolUses = toolUses
+    }
+
+    return assistantResponseMessage
   }
 
   getContentText(message) {
