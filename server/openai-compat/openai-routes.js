@@ -10,7 +10,7 @@ import AccountPool from './account-pool.js'
 import RequestLogger from './request-logger.js'
 import { validateApiKey } from './auth-middleware.js'
 import { getClientIp } from '../utils/request-utils.js'
-import { isRetryableError, isQuotaExhaustedError } from '../utils/retry-utils.js'
+import { isRetryableError, isQuotaExhaustedError, isBannedError } from '../utils/retry-utils.js'
 import { convertMessages, extractSystemPrompt, estimateTokens } from './openai-converter.js'
 import { buildOpenAIResponse, buildStreamChunk, buildToolCallChunk } from './openai-response.js'
 
@@ -501,8 +501,11 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         }
 
         if (hasError) {
-          // 检查是否为 402 配额耗尽错误
-          if (isQuotaExhaustedError(error)) {
+          // 检查是否为封禁错误（Bad credentials 或 BANNED:TEMPORARILY_SUSPENDED）
+          if (isBannedError(error)) {
+            // 封禁错误：永久移除账号并标记为封禁状态
+            await accountPool.banAccount(currentAccount.id, error.message)
+          } else if (isQuotaExhaustedError(error)) {
             // 402 错误：异步更新使用量，不重试（次月1日才会恢复额度）
             accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
           } else if (isRetryableError(error)) {
@@ -511,7 +514,9 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
           // 确定错误类型
           let errorType = 'stream_error'
-          if (isQuotaExhaustedError(error)) {
+          if (isBannedError(error)) {
+            errorType = 'account_banned'
+          } else if (isQuotaExhaustedError(error)) {
             errorType = 'quota_exhausted'
           } else if (isRetryableError(error)) {
             errorType = 'token_expired'
@@ -652,8 +657,11 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       } catch (error) {
         console.error('[OpenAI API] Error:', error.message)
 
-        // 检查是否为 402 配额耗尽错误
-        if (isQuotaExhaustedError(error)) {
+        // 检查是否为封禁错误（Bad credentials 或 BANNED:TEMPORARILY_SUSPENDED）
+        if (isBannedError(error)) {
+          // 封禁错误：永久移除账号并标记为封禁状态
+          await accountPool.banAccount(account.id, error.message)
+        } else if (isQuotaExhaustedError(error)) {
           // 402 错误：异步更新使用量，不重试（次月1日才会恢复额度）
           accountPool.markAccountQuotaExhausted(account.id, error.message)
         } else if (isRetryableError(error)) {
@@ -662,7 +670,9 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
         // 确定错误类型
         let errorType = 'api_error'
-        if (isQuotaExhaustedError(error)) {
+        if (isBannedError(error)) {
+          errorType = 'account_banned'
+        } else if (isQuotaExhaustedError(error)) {
           errorType = 'quota_exhausted'
         } else if (error.message.includes('403')) {
           errorType = 'forbidden'

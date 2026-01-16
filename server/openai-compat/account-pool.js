@@ -730,6 +730,72 @@ class AccountPool {
   }
 
   /**
+   * 永久封禁账号
+   * 当检测到 Bad credentials 或 BANNED:TEMPORARILY_SUSPENDED 等错误时调用
+   * 将账号从活跃池和冷却池中移除，并在数据库中标记为封禁状态
+   * @param {string} accountId - 账号 ID
+   * @param {string} reason - 封禁原因
+   * @returns {Promise<boolean>} 是否成功封禁
+   */
+  async banAccount(accountId, reason) {
+    try {
+      // 从活跃池移除
+      const activeEntry = this.activePool.get(accountId)
+      if (activeEntry) {
+        this.activePool.delete(accountId)
+        console.log(`[AccountPool] Account ${activeEntry.account.email} removed from active pool (banned)`)
+      }
+
+      // 从冷却池移除
+      const coolingEntry = this.coolingPool.get(accountId)
+      if (coolingEntry) {
+        this.coolingPool.delete(accountId)
+        console.log(`[AccountPool] Account ${coolingEntry.account.email} removed from cooling pool (banned)`)
+      }
+
+      // 更新数据库状态为 banned
+      await this.dbPool.query(
+        `UPDATE accounts SET status = 'banned', last_error = ?, updated_at = ? WHERE id = ?`,
+        [reason, Date.now(), accountId]
+      )
+
+      const email = activeEntry?.account?.email || coolingEntry?.account?.email || accountId
+      console.log(`[AccountPool] Account ${email} has been permanently banned: ${reason}`)
+
+      // 记录日志
+      if (this.systemLogger) {
+        await this.systemLogger.logAccountPool({
+          action: 'account_banned',
+          message: `账号 ${email} 已被永久封禁`,
+          details: {
+            accountId,
+            email,
+            reason,
+            wasInActivePool: !!activeEntry,
+            wasInCoolingPool: !!coolingEntry
+          },
+          level: 'error'
+        }).catch(() => {})
+      }
+
+      // 触发告警
+      await this.triggerAlert({
+        alertType: 'ACCOUNT_BANNED',
+        severity: 'WARNING',
+        message: `账号 ${email} 已被封禁: ${reason}`,
+        details: { accountId, email, reason },
+        threshold: 0,
+        currentValue: 1
+      })
+
+      return true
+    } catch (error) {
+      console.error(`[AccountPool] Failed to ban account ${accountId}:`, error.message)
+      return false
+    }
+  }
+
+  /**
    * 从活跃池获取下一个账号（轮询）
    * @returns {object|null} 账号对象或 null
    */

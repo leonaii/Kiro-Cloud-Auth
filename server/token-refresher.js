@@ -36,8 +36,8 @@ const DEFAULT_EXPIRES_IN = 50 * 60 // 默认过期时间 50 分钟（秒）
 const MIN_EXPIRES_IN = 5 * 60 // 最小合理过期时间 5 分钟（秒）- 降低阈值避免不必要的重试
 const MAX_EXPIRES_IN = 2 * 60 * 60 // 最大合理过期时间 2 小时（秒）
 
-const MIN_DELAY_MS = 500 // 最小延迟 1 秒
-const MAX_DELAY_MS = 2500 // 最大延迟 3 秒
+const MIN_DELAY_MS = 1000 // 最小延迟 1 秒
+const MAX_DELAY_MS = 5000 // 最大延迟 5 秒
 
 // 重试配置
 const MAX_RETRY_ATTEMPTS = 3 // 最大重试次数

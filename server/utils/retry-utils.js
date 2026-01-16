@@ -36,3 +36,21 @@ export function isQuotaExhaustedError(error) {
   const msg = error.message || ''
   return msg.includes('402') || msg.includes('quota') || msg.includes('Payment Required')
 }
+
+/**
+ * 判断是否为账号被封禁错误
+ * 包括：Bad credentials（凭证无效）和 BANNED:TEMPORARILY_SUSPENDED（临时封禁）
+ * 这类错误应该永久移除账号并标记为封禁状态
+ * @param {Error} error - 错误对象
+ * @returns {boolean}
+ */
+export function isBannedError(error) {
+  const msg = error.message || ''
+  return (
+    msg.includes('Bad credentials') ||
+    msg.includes('BANNED:TEMPORARILY_SUSPENDED') ||
+    msg.includes('BANNED:') ||
+    msg.includes('account has been suspended') ||
+    msg.includes('account is suspended')
+  )
+}
