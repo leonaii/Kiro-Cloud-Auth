@@ -9,12 +9,6 @@ import KiroClient, { SUPPORTED_MODELS, checkThinkingMode } from './kiro-client.j
 import AccountPool from './account-pool.js'
 import RequestLogger from './request-logger.js'
 import { validateApiKey } from './auth-middleware.js'
-import {
-  estimateTokens,
-  estimateInputTokens,
-  estimateOutputTokens,
-  getContentText
-} from './token-counter.js'
 
 const router = Router()
 let accountPool = null
@@ -24,25 +18,22 @@ let dbPool = null
 
 /**
  * 初始化路由
- * @param {object} pool - 数据库连接池
- * @param {object} sysLogger - 系统日志实例
- * @param {AccountPool} externalAccountPool - 外部账号池实例（可选，用于共享活跃池）
  */
-export function initOpenAIRoutes(pool, sysLogger = null, externalAccountPool = null) {
+export function initOpenAIRoutes(pool, sysLogger = null) {
   dbPool = pool
   systemLogger = sysLogger
-  // 如果提供了外部账号池，使用它；否则创建新实例
-  accountPool = externalAccountPool || new AccountPool(dbPool, systemLogger)
+  accountPool = new AccountPool(dbPool, systemLogger)
   requestLogger = new RequestLogger(dbPool)
   requestLogger.startCleanup()
   return router
 }
 
 /**
- * 获取当前使用的账号池实例
+ * 估算 token 数量（简单实现）
  */
-export function getAccountPool() {
-  return accountPool
+function estimateTokens(text) {
+  if (!text) return 0
+  return Math.ceil(text.length / 4)
 }
 
 /**
@@ -115,30 +106,8 @@ function buildOpenAIResponse(content, model, inputTokens, outputTokens, finishRe
  * @param {string} model - 模型名称
  * @param {string|null} finishReason - 结束原因
  * @param {string} deltaType - delta 类型：'content' 或 'thinking'
- * @param {boolean} isFirst - 是否是第一个 chunk（需要包含 role）
  */
-function buildStreamChunk(content, model, finishReason = null, deltaType = 'content', isFirst = false) {
-  let delta = {}
-  
-  if (finishReason) {
-    // 结束 chunk，delta 为空
-    delta = {}
-  } else if (isFirst) {
-    // 第一个 chunk，包含 role 和 content
-    if (deltaType === 'thinking') {
-      delta = { role: 'assistant', reasoning_content: content }
-    } else {
-      delta = { role: 'assistant', content }
-    }
-  } else {
-    // 后续 chunk，只包含 content
-    if (deltaType === 'thinking') {
-      delta = { reasoning_content: content }
-    } else {
-      delta = { content }
-    }
-  }
-  
+function buildStreamChunk(content, model, finishReason = null, deltaType = 'content') {
   const chunk = {
     id: `chatcmpl-${uuidv4()}`,
     object: 'chat.completion.chunk',
@@ -147,7 +116,11 @@ function buildStreamChunk(content, model, finishReason = null, deltaType = 'cont
     choices: [
       {
         index: 0,
-        delta,
+        delta: finishReason ? {} : (
+          deltaType === 'thinking'
+            ? { reasoning_content: content }
+            : { content }
+        ),
         logprobs: null,
         finish_reason: finishReason
       }
@@ -269,8 +242,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         userAgent,
         isThinking,
         thinkingBudget,
-        requestHeaders: req.headers,
-        apiProtocol: 'openai'
+        requestHeaders: req.headers
       })
 
       return res.status(400).json({
@@ -307,8 +279,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             userAgent,
             isThinking,
             thinkingBudget,
-            requestHeaders: req.headers,
-            apiProtocol: 'openai'
+            requestHeaders: req.headers
           })
 
           return res.status(404).json({
@@ -334,8 +305,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             userAgent,
             isThinking,
             thinkingBudget,
-            requestHeaders: req.headers,
-            apiProtocol: 'openai'
+            requestHeaders: req.headers
           })
 
           return res.status(403).json({
@@ -364,8 +334,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         userAgent,
         isThinking,
         thinkingBudget,
-        requestHeaders: req.headers,
-        apiProtocol: 'openai'
+        requestHeaders: req.headers
       })
 
       return res.status(503).json({
@@ -449,22 +418,19 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       let accountSwitched = false
 
       let thinkingContent = ''  // 累积 thinking 内容
-      let isFirstChunk = true   // 跟踪是否是第一个 chunk
 
       try {
         for await (const event of streamResult.stream) {
           if (event.type === 'content' && event.content) {
             fullContent += event.content
-            res.write(buildStreamChunk(event.content, model, null, 'content', isFirstChunk))
-            isFirstChunk = false
+            res.write(buildStreamChunk(event.content, model))
           } else if (event.type === 'thinking_start') {
             // Thinking 开始，可选：发送空的 thinking chunk 作为开始标记
             // 这里不发送任何内容，等待实际的 thinking 内容
           } else if (event.type === 'thinking' && event.thinking) {
             // 发送 thinking 内容片段
             thinkingContent += event.thinking
-            res.write(buildStreamChunk(event.thinking, model, null, 'thinking', isFirstChunk))
-            isFirstChunk = false
+            res.write(buildStreamChunk(event.thinking, model, null, 'thinking'))
           } else if (event.type === 'thinking_end') {
             // Thinking 结束，可选：发送结束标记
             // 这里不发送额外内容，thinking 内容已经通过 thinking 事件发送
@@ -484,9 +450,6 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         res.write(buildStreamChunk('', model, 'stop'))
         res.write('data: [DONE]\n\n')
 
-        // 标记账号调用成功（重置错误计数）
-        accountPool.markAccountSuccess(currentAccount.id)
-
         const outputTokens = estimateTokens(fullContent)
         requestLogger.logSuccess({
           requestId,
@@ -502,8 +465,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           isThinking,
           thinkingBudget,
           headerVersion: currentAccount.header_version || 1,
-          requestHeaders: kiroHeaders,
-          apiProtocol: 'openai'
+          requestHeaders: kiroHeaders
         })
       } catch (error) {
         hasError = true
@@ -540,16 +502,13 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
               // 重新处理新流
               thinkingContent = ''  // 重置 thinking 内容
-              let isFirstChunkRetry = true  // 重试时也需要跟踪第一个 chunk
               for await (const event of newStream) {
                 if (event.type === 'content' && event.content) {
                   fullContent += event.content
-                  res.write(buildStreamChunk(event.content, model, null, 'content', isFirstChunkRetry))
-                  isFirstChunkRetry = false
+                  res.write(buildStreamChunk(event.content, model))
                 } else if (event.type === 'thinking' && event.thinking) {
                   thinkingContent += event.thinking
-                  res.write(buildStreamChunk(event.thinking, model, null, 'thinking', isFirstChunkRetry))
-                  isFirstChunkRetry = false
+                  res.write(buildStreamChunk(event.thinking, model, null, 'thinking'))
                 } else if (event.type === 'token_refreshed' && event.newTokens) {
                   const expiresAt = Date.now() + (event.newTokens.expiresIn || 3600) * 1000
                   await accountPool.updateAccountToken(
@@ -564,9 +523,6 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
               res.write(buildStreamChunk('', model, 'stop'))
               res.write('data: [DONE]\n\n')
-
-              // 标记新账号调用成功（重置错误计数）
-              accountPool.markAccountSuccess(currentAccount.id)
 
               const outputTokens = estimateTokens(fullContent)
               requestLogger.logSuccess({
@@ -583,8 +539,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
                 isThinking,
                 thinkingBudget,
                 headerVersion: currentAccount.header_version || 1,
-                requestHeaders: kiroHeaders,
-                apiProtocol: 'openai'
+                requestHeaders: kiroHeaders
               })
 
               console.log(`[OpenAI API] Successfully recovered from TOKEN_EXPIRED by switching accounts`)
@@ -619,8 +574,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             isThinking,
             thinkingBudget,
             headerVersion: currentAccount.header_version || 1,
-            requestHeaders: kiroHeaders,
-            apiProtocol: 'openai'
+            requestHeaders: kiroHeaders
           })
 
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -685,9 +639,6 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           }
         }
 
-        // 标记账号调用成功（重置错误计数）
-        accountPool.markAccountSuccess(result.account.id)
-
         const outputTokens = estimateTokens(result.parsed.content)
         requestLogger.logSuccess({
           requestId,
@@ -703,8 +654,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           isThinking,
           thinkingBudget,
           headerVersion: result.account.header_version || 1,
-          requestHeaders: kiroHeaders,
-          apiProtocol: 'openai'
+          requestHeaders: kiroHeaders
         })
 
         // 传递 contentBlocks 以支持 thinking 内容
@@ -738,8 +688,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           isThinking,
           thinkingBudget,
           headerVersion: account.header_version || 1,
-          requestHeaders: kiroHeaders,
-          apiProtocol: 'openai'
+          requestHeaders: kiroHeaders
         })
 
         res.status(500).json({
@@ -769,8 +718,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       isThinking,
       thinkingBudget,
       headerVersion: account?.header_version || 1,
-      requestHeaders: account ? kiroHeaders : req.headers,
-      apiProtocol: 'openai'
+      requestHeaders: account ? kiroHeaders : req.headers
     })
 
     res.status(500).json({
