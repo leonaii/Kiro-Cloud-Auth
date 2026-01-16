@@ -253,6 +253,7 @@ async function handleStreamResponse(req, res, options) {
   let contentBlockIndex = 0
   let thinkingBlockStarted = false
   let textBlockStarted = false
+  let timeToFirstByte = null  // 首字响应时间
 
   // 发送 message_start 事件
   res.write(buildSSEEvent('message_start', {
@@ -272,6 +273,10 @@ async function handleStreamResponse(req, res, options) {
   try {
     for await (const event of streamResult.stream) {
       if (event.type === 'thinking_start') {
+        // 记录首字响应时间（thinking_start 也算首字）
+        if (timeToFirstByte === null) {
+          timeToFirstByte = Date.now() - startTime
+        }
         if (!thinkingBlockStarted) {
           res.write(buildSSEEvent('content_block_start', {
             type: 'content_block_start',
@@ -281,6 +286,10 @@ async function handleStreamResponse(req, res, options) {
           thinkingBlockStarted = true
         }
       } else if (event.type === 'thinking' && event.thinking) {
+        // 记录首字响应时间
+        if (timeToFirstByte === null) {
+          timeToFirstByte = Date.now() - startTime
+        }
         thinkingContent += event.thinking
         res.write(buildSSEEvent('content_block_delta', {
           type: 'content_block_delta',
@@ -297,6 +306,10 @@ async function handleStreamResponse(req, res, options) {
           thinkingBlockStarted = false
         }
       } else if (event.type === 'content' && event.content) {
+        // 记录首字响应时间
+        if (timeToFirstByte === null) {
+          timeToFirstByte = Date.now() - startTime
+        }
         if (!textBlockStarted) {
           res.write(buildSSEEvent('content_block_start', {
             type: 'content_block_start',
@@ -345,16 +358,18 @@ async function handleStreamResponse(req, res, options) {
       requestId,
       accountId: currentAccount.id,
       accountEmail: currentAccount.email,
+      accountIdp: currentAccount.idp,
       model,
       isStream: true,
       requestTokens: inputTokens,
       responseTokens: outputTokens,
       durationMs: Date.now() - startTime,
+      timeToFirstByte,
       clientIp,
       userAgent,
       isThinking,
       thinkingBudget,
-      headerVersion: currentAccount.header_version || 1,
+      headerVersion: currentAccount.headerVersion || 1,
       requestHeaders: kiroHeaders,
       apiProtocol: 'claude'
     })
@@ -363,6 +378,30 @@ async function handleStreamResponse(req, res, options) {
     if (isRetryableError(error)) {
       await accountPool.markAccountError(currentAccount.id)
     }
+    
+    // 记录错误日志
+    requestLogger.logError({
+      requestId,
+      accountId: currentAccount.id,
+      accountEmail: currentAccount.email,
+      accountIdp: currentAccount.idp,
+      model,
+      isStream: true,
+      errorType: isRetryableError(error) ? 'token_expired' : 'stream_error',
+      errorMessage: error.message,
+      requestTokens: inputTokens,
+      responseTokens: estimateTokens(fullContent),
+      durationMs: Date.now() - startTime,
+      timeToFirstByte,
+      clientIp,
+      userAgent,
+      isThinking,
+      thinkingBudget,
+      headerVersion: currentAccount.headerVersion || 1,
+      requestHeaders: kiroHeaders,
+      apiProtocol: 'claude'
+    })
+    
     res.write(buildSSEEvent('error', {
       type: 'error',
       error: { type: 'api_error', message: error.message }
@@ -432,6 +471,7 @@ async function handleNonStreamResponse(req, res, options) {
       requestId,
       accountId: result.account.id,
       accountEmail: result.account.email,
+      accountIdp: result.account.idp,
       model,
       isStream: false,
       requestTokens: inputTokens,
@@ -441,7 +481,7 @@ async function handleNonStreamResponse(req, res, options) {
       userAgent,
       isThinking,
       thinkingBudget,
-      headerVersion: result.account.header_version || 1,
+      headerVersion: result.account.headerVersion || 1,
       requestHeaders: kiroHeaders,
       apiProtocol: 'claude'
     })

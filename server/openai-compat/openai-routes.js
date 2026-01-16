@@ -301,10 +301,15 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
       let thinkingContent = ''  // 累积 thinking 内容
       let isFirstChunk = true   // 跟踪是否为首个 chunk
+      let timeToFirstByte = null  // 首字响应时间
 
       try {
         for await (const event of streamResult.stream) {
           if (event.type === 'content' && event.content) {
+            // 记录首字响应时间
+            if (timeToFirstByte === null) {
+              timeToFirstByte = Date.now() - startTime
+            }
             fullContent += event.content
             res.write(buildStreamChunk(event.content, model, null, 'content', isFirstChunk))
             isFirstChunk = false
@@ -312,6 +317,10 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             // Thinking 开始，可选：发送空的 thinking chunk 作为开始标记
             // 这里不发送任何内容，等待实际的 thinking 内容
           } else if (event.type === 'thinking' && event.thinking) {
+            // 记录首字响应时间（thinking 也算首字）
+            if (timeToFirstByte === null) {
+              timeToFirstByte = Date.now() - startTime
+            }
             // 发送 thinking 内容片段
             thinkingContent += event.thinking
             res.write(buildStreamChunk(event.thinking, model, null, 'thinking', isFirstChunk))
@@ -340,16 +349,18 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           requestId,
           accountId: currentAccount.id,
           accountEmail: currentAccount.email,
+          accountIdp: currentAccount.idp,
           model,
           isStream: true,
           requestTokens: inputTokens,
           responseTokens: outputTokens,
           durationMs: Date.now() - startTime,
+          timeToFirstByte,
           clientIp,
           userAgent,
           isThinking,
           thinkingBudget,
-          headerVersion: currentAccount.header_version || 1,
+          headerVersion: currentAccount.headerVersion || 1,
           requestHeaders: kiroHeaders
         })
       } catch (error) {
@@ -388,12 +399,20 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
               // 重新处理新流
               thinkingContent = ''  // 重置 thinking 内容
               let isFirstChunkRetry = true  // 重试时重置首个 chunk 标志
+              let retryStartTime = Date.now()  // 重试开始时间
+              let timeToFirstByteRetry = null  // 重试的首字响应时间
               for await (const event of newStream) {
                 if (event.type === 'content' && event.content) {
+                  if (timeToFirstByteRetry === null) {
+                    timeToFirstByteRetry = Date.now() - retryStartTime
+                  }
                   fullContent += event.content
                   res.write(buildStreamChunk(event.content, model, null, 'content', isFirstChunkRetry))
                   isFirstChunkRetry = false
                 } else if (event.type === 'thinking' && event.thinking) {
+                  if (timeToFirstByteRetry === null) {
+                    timeToFirstByteRetry = Date.now() - retryStartTime
+                  }
                   thinkingContent += event.thinking
                   res.write(buildStreamChunk(event.thinking, model, null, 'thinking', isFirstChunkRetry))
                   isFirstChunkRetry = false
@@ -417,16 +436,18 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
                 requestId,
                 accountId: currentAccount.id,
                 accountEmail: currentAccount.email,
+                accountIdp: currentAccount.idp,
                 model,
                 isStream: true,
                 requestTokens: inputTokens,
                 responseTokens: outputTokens,
                 durationMs: Date.now() - startTime,
+                timeToFirstByte: timeToFirstByteRetry,
                 clientIp,
                 userAgent,
                 isThinking,
                 thinkingBudget,
-                headerVersion: currentAccount.header_version || 1,
+                headerVersion: currentAccount.headerVersion || 1,
                 requestHeaders: kiroHeaders
               })
 
@@ -450,6 +471,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             requestId,
             accountId: currentAccount.id,
             accountEmail: currentAccount.email,
+            accountIdp: currentAccount.idp,
             model,
             isStream: true,
             errorType: isRetryableError(error) ? 'token_expired' : 'stream_error',
@@ -457,11 +479,12 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             requestTokens: inputTokens,
             responseTokens: estimateTokens(fullContent),
             durationMs: Date.now() - startTime,
+            timeToFirstByte,
             clientIp,
             userAgent,
             isThinking,
             thinkingBudget,
-            headerVersion: currentAccount.header_version || 1,
+            headerVersion: currentAccount.headerVersion || 1,
             requestHeaders: kiroHeaders
           })
 
@@ -532,6 +555,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           requestId,
           accountId: result.account.id,
           accountEmail: result.account.email,
+          accountIdp: result.account.idp,
           model,
           isStream: false,
           requestTokens: inputTokens,
@@ -541,7 +565,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           userAgent,
           isThinking,
           thinkingBudget,
-          headerVersion: result.account.header_version || 1,
+          headerVersion: result.account.headerVersion || 1,
           requestHeaders: kiroHeaders
         })
 
@@ -565,6 +589,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           requestId,
           accountId: account.id,
           accountEmail: account.email,
+          accountIdp: account.idp,
           model,
           isStream: false,
           errorType: error.message.includes('403') ? 'forbidden' : 'api_error',
@@ -575,7 +600,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           userAgent,
           isThinking,
           thinkingBudget,
-          headerVersion: account.header_version || 1,
+          headerVersion: account.headerVersion || 1,
           requestHeaders: kiroHeaders
         })
 
@@ -595,6 +620,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       requestId,
       accountId: account?.id,
       accountEmail: account?.email,
+      accountIdp: account?.idp,
       model,
       isStream: stream,
       errorType: 'unexpected_error',
@@ -605,7 +631,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       userAgent,
       isThinking,
       thinkingBudget,
-      headerVersion: account?.header_version || 1,
+      headerVersion: account?.headerVersion || 1,
       requestHeaders: account ? kiroHeaders : req.headers
     })
 

@@ -49,13 +49,14 @@ class RequestLogger {
     requestTokens,
     responseTokens,
     durationMs,
+    timeToFirstByte = null,
     clientIp,
     userAgent,
     isThinking = false,
     thinkingBudget = 0,
     headerVersion = 1,
     requestHeaders = null,
-    apiProtocol = 'openai'  // API 协议类型：openai 或 claude
+    apiProtocol = 'openai'
   }) {
     // 脱敏并序列化请求头
     const sanitizedHeaders = this.sanitizeHeaders(requestHeaders)
@@ -66,8 +67,8 @@ class RequestLogger {
       `INSERT INTO api_request_logs
        (server_id, request_id, account_id, account_email, account_idp, model, is_stream, status,
         error_type, error_message, request_tokens, response_tokens,
-        duration_ms, client_ip, user_agent, is_thinking, thinking_budget, header_version, request_headers, api_protocol)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        duration_ms, time_to_first_byte, client_ip, user_agent, is_thinking, thinking_budget, header_version, request_headers, api_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         this.serverId,
         requestId || uuidv4(),
@@ -82,6 +83,7 @@ class RequestLogger {
         requestTokens || 0,
         responseTokens || 0,
         durationMs || 0,
+        timeToFirstByte || null,
         clientIp || null,
         userAgent || null,
         isThinking ? 1 : 0,

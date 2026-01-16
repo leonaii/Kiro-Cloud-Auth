@@ -39,6 +39,7 @@ interface LogEntry {
   request_tokens: number
   response_tokens: number
   duration_ms: number
+  time_to_first_byte: number | null
   client_ip: string | null
   user_agent: string | null
   server_id: string | null
@@ -471,13 +472,15 @@ function LogDetailModal({ log, onClose, isMobile }: { log: LogEntry; onClose: ()
             <DetailRow label="请求 ID" value={log.request_id} mono />
             <DetailRow label="状态" value={log.status === 'success' ? '成功' : '失败'} />
             <DetailRow label="API 协议" value={log.api_protocol === 'openai' ? 'OpenAI' : log.api_protocol === 'claude' ? 'Claude' : '-'} />
+            <DetailRow label="Header 版本" value={`V${log.header_version || 1}`} />
             {log.server_id ? <DetailRow label="服务器" value={log.server_id} /> : null}
             <DetailRow label="账号" value={log.account_email || '-'} />
             {log.account_idp ? <DetailRow label="账号类型" value={log.account_idp} /> : null}
             <DetailRow label="模型" value={log.model || '-'} />
             <DetailRow label="流式" value={log.is_stream ? '是' : '否'} />
             <DetailRow label="思考模式" value={log.is_thinking ? '是' : '否'} />
-            <DetailRow label="耗时" value={formatDuration(log.duration_ms)} />
+            <DetailRow label="总耗时" value={formatDuration(log.duration_ms)} />
+            {log.is_stream && log.time_to_first_byte !== null ? <DetailRow label="首字响应" value={formatDuration(log.time_to_first_byte)} /> : null}
             <DetailRow label="请求 Tokens" value={log.request_tokens.toString()} />
             <DetailRow label="响应 Tokens" value={log.response_tokens.toString()} />
             {log.is_thinking && log.thinking_budget > 0 ? <DetailRow label="思考 Tokens" value={log.thinking_budget.toLocaleString()} /> : null}
@@ -488,6 +491,12 @@ function LogDetailModal({ log, onClose, isMobile }: { log: LogEntry; onClose: ()
                 <h4 className="text-sm font-medium text-rose-500 mb-1">错误信息</h4>
                 <DetailRow label="错误类型" value={log.error_type} />
                 {log.error_message ? <div className="mt-1"><p className="text-xs text-muted-foreground mb-1">错误详情</p><pre className="p-2 bg-rose-50 dark:bg-rose-900/20 rounded-lg text-xs text-rose-700 dark:text-rose-400 whitespace-pre-wrap break-all">{log.error_message}</pre></div> : null}
+              </div>
+            ) : null}
+            {log.request_headers ? (
+              <div className="border-t pt-2 mt-2">
+                <p className="text-xs text-muted-foreground mb-1">请求头</p>
+                <pre className="p-2 bg-muted rounded-lg text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-auto">{JSON.stringify(log.request_headers, null, 2)}</pre>
               </div>
             ) : null}
             {log.user_agent ? (
@@ -514,13 +523,15 @@ function LogDetailModal({ log, onClose, isMobile }: { log: LogEntry; onClose: ()
           <DetailRow label="请求 ID" value={log.request_id} mono />
           <DetailRow label="状态" value={log.status === 'success' ? '成功' : '失败'} />
           <DetailRow label="API 协议" value={log.api_protocol === 'openai' ? 'OpenAI' : log.api_protocol === 'claude' ? 'Claude' : '-'} />
+          <DetailRow label="Header 版本" value={`V${log.header_version || 1}`} />
           {log.server_id ? <DetailRow label="服务器" value={log.server_id} /> : null}
           <DetailRow label="账号" value={log.account_email || '-'} />
           {log.account_idp ? <DetailRow label="账号类型" value={log.account_idp} /> : null}
           <DetailRow label="模型" value={log.model || '-'} />
           <DetailRow label="流式" value={log.is_stream ? '是' : '否'} />
           <DetailRow label="思考模式" value={log.is_thinking ? '是' : '否'} />
-          <DetailRow label="耗时" value={formatDuration(log.duration_ms)} />
+          <DetailRow label="总耗时" value={formatDuration(log.duration_ms)} />
+          {log.is_stream && log.time_to_first_byte !== null ? <DetailRow label="首字响应" value={formatDuration(log.time_to_first_byte)} /> : null}
           <DetailRow label="请求 Tokens" value={log.request_tokens.toString()} />
           <DetailRow label="响应 Tokens" value={log.response_tokens.toString()} />
           {log.is_thinking && log.thinking_budget > 0 ? <DetailRow label="思考 Tokens" value={log.thinking_budget.toLocaleString()} /> : null}
@@ -531,6 +542,12 @@ function LogDetailModal({ log, onClose, isMobile }: { log: LogEntry; onClose: ()
               <h4 className="text-sm font-medium text-rose-500 mb-2">错误信息</h4>
               <DetailRow label="错误类型" value={log.error_type} />
               {log.error_message ? <div className="mt-2"><p className="text-xs text-muted-foreground mb-1">错误详情</p><pre className="p-2 bg-rose-50 dark:bg-rose-900/20 rounded-lg text-xs text-rose-700 dark:text-rose-400 whitespace-pre-wrap break-all">{log.error_message}</pre></div> : null}
+            </div>
+          ) : null}
+          {log.request_headers ? (
+            <div className="border-t pt-3 mt-2">
+              <p className="text-xs text-muted-foreground mb-1">请求头 (发送给 Kiro API)</p>
+              <pre className="p-2 bg-muted rounded-lg text-xs font-mono whitespace-pre-wrap break-all max-h-48 overflow-auto">{JSON.stringify(log.request_headers, null, 2)}</pre>
             </div>
           ) : null}
           {log.user_agent ? (

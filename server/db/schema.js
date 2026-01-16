@@ -165,6 +165,7 @@ export const API_REQUEST_LOGS_COLUMNS = [
   { name: 'request_tokens', definition: 'INT DEFAULT 0' },
   { name: 'response_tokens', definition: 'INT DEFAULT 0' },
   { name: 'duration_ms', definition: 'INT DEFAULT 0' },
+  { name: 'time_to_first_byte', definition: 'INT DEFAULT NULL' },  // 流式请求首字响应时间（毫秒），非流式请求为 NULL
   { name: 'client_ip', definition: 'VARCHAR(45)' },
   { name: 'user_agent', definition: 'VARCHAR(500)' },
   { name: 'is_thinking', definition: 'BOOLEAN DEFAULT FALSE' },
