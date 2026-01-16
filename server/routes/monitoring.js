@@ -13,6 +13,9 @@ const router = express.Router()
 // TokenRefresher 实例引用（由 index.js 设置，避免循环依赖）
 let tokenRefresherInstance = null
 
+// AccountPool 实例引用（由 index.js 设置，避免循环依赖）
+let accountPoolInstance = null
+
 /**
  * 设置 TokenRefresher 实例（由 index.js 调用）
  */
@@ -21,10 +24,24 @@ export function setTokenRefresher(refresher) {
 }
 
 /**
+ * 设置 AccountPool 实例（由 index.js 调用）
+ */
+export function setAccountPool(pool) {
+  accountPoolInstance = pool
+}
+
+/**
  * 获取 TokenRefresher 实例
  */
 function getTokenRefresher() {
   return tokenRefresherInstance
+}
+
+/**
+ * 获取 AccountPool 实例
+ */
+function getAccountPool() {
+  return accountPoolInstance
 }
 
 /**
@@ -411,6 +428,145 @@ router.get('/logs', async (req, res) => {
     })
   } catch (error) {
     console.error('[Monitoring] Failed to get logs:', error.message)
+    res.status(500).json({
+      success: false,
+      error: 'INTERNAL_ERROR',
+      message: error.message
+    })
+  }
+})
+
+/**
+ * GET /api/monitoring/account-pool
+ * 获取账号池状态（活跃池/冷却池）
+ */
+router.get('/account-pool', async (req, res) => {
+  try {
+    const accountPool = getAccountPool()
+    
+    if (!accountPool) {
+      return res.status(503).json({
+        success: false,
+        error: 'SERVICE_UNAVAILABLE',
+        message: '账号池服务未初始化'
+      })
+    }
+    
+    // 获取活跃池状态
+    const activePoolStatus = accountPool.getActivePoolStatus()
+    
+    // 获取账号池统计信息
+    const poolStats = accountPool.stats || {}
+    
+    // 获取缓存状态
+    const cacheStatus = {
+      size: accountPool.accountsCache?.size || 0,
+      expiry: accountPool.cacheExpiry || 0,
+      dbConnectionFailed: accountPool.dbConnectionFailed || false
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        activePool: activePoolStatus,
+        cache: cacheStatus,
+        stats: {
+          cacheHits: poolStats.cacheHits || 0,
+          cacheMisses: poolStats.cacheMisses || 0,
+          dbErrors: poolStats.dbErrors || 0,
+          staleCacheUsed: poolStats.staleCacheUsed || 0,
+          validationErrors: poolStats.validationErrors || 0,
+          dataRepairs: poolStats.dataRepairs || 0,
+          incompleteAccounts: poolStats.incompleteAccounts || 0,
+          healthScore: poolStats.healthScore || 100,
+          lastHealthCheck: poolStats.lastHealthCheck || null
+        },
+        timestamp: Date.now()
+      }
+    })
+  } catch (error) {
+    console.error('[Monitoring] Failed to get account pool status:', error.message)
+    res.status(500).json({
+      success: false,
+      error: 'INTERNAL_ERROR',
+      message: error.message
+    })
+  }
+})
+
+/**
+ * GET /api/monitoring/token-refresher
+ * 获取 Token 刷新器详细状态
+ */
+router.get('/token-refresher', async (req, res) => {
+  try {
+    const tokenRefresher = getTokenRefresher()
+    
+    if (!tokenRefresher) {
+      return res.status(503).json({
+        success: false,
+        error: 'SERVICE_UNAVAILABLE',
+        message: 'Token 刷新器未初始化或已禁用'
+      })
+    }
+    
+    // 获取下次检测信息
+    const nextCheckInfo = tokenRefresher.getNextCheckInfo()
+    
+    // 获取统计信息
+    const stats = tokenRefresher.getStats()
+    
+    // 获取重试队列信息
+    const retryQueue = []
+    if (tokenRefresher.retryQueue) {
+      for (const [accountId, info] of tokenRefresher.retryQueue.entries()) {
+        retryQueue.push({
+          accountId,
+          attempts: info.attempts,
+          nextRetryTime: info.nextRetryTime,
+          errorType: info.errorType,
+          lastError: info.lastError
+        })
+      }
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        status: {
+          isRunning: nextCheckInfo.isRunning,
+          isRefreshing: nextCheckInfo.isRefreshing,
+          nextCheckTime: nextCheckInfo.nextCheckTime,
+          lastCheckTime: nextCheckInfo.lastCheckTime,
+          timeUntilNextCheck: nextCheckInfo.timeUntilNextCheck,
+          checkInterval: nextCheckInfo.checkInterval,
+          activePoolOnlyMode: nextCheckInfo.activePoolOnlyMode,
+          activePoolAvailable: nextCheckInfo.activePoolAvailable
+        },
+        stats: {
+          totalRefreshes: stats.totalRefreshes || 0,
+          successfulRefreshes: stats.successfulRefreshes || 0,
+          failedRefreshes: stats.failedRefreshes || 0,
+          successRate: stats.successRate || '0%',
+          recentFailureRate: stats.recentFailureRate || '0%',
+          avgDurationMs: stats.avgDurationMs || 0,
+          p95DurationMs: stats.p95DurationMs || 0,
+          errorsByType: stats.errorsByType || {},
+          databaseRetries: stats.databaseRetries || 0,
+          deadlockCount: stats.deadlockCount || 0,
+          lockSkipped: stats.lockSkipped || 0,
+          activePoolRefreshes: stats.activePoolRefreshes || 0,
+          skippedNonActivePool: stats.skippedNonActivePool || 0
+        },
+        retryQueue: {
+          size: retryQueue.length,
+          items: retryQueue
+        },
+        timestamp: Date.now()
+      }
+    })
+  } catch (error) {
+    console.error('[Monitoring] Failed to get token refresher status:', error.message)
     res.status(500).json({
       success: false,
       error: 'INTERNAL_ERROR',

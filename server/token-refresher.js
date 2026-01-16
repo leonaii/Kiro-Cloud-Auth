@@ -1166,6 +1166,9 @@ class TokenRefresher {
           // 构建 IN 子句的占位符
           const placeholders = activePoolAccountIds.map(() => '?').join(',')
 
+          // 查询活跃池中需要刷新的账号
+          // 只要 cred_expires_at < threshold（即将过期或已过期）就刷新
+          // 因为 cred_refresh_token 有效期很长（至少2个月），不需要下限检查
           const [activeRows] = await this.executeWithRetry(
             conn,
             `SELECT id, email, idp, cred_access_token, cred_refresh_token,
@@ -1177,12 +1180,12 @@ class TokenRefresher {
                AND cred_refresh_token IS NOT NULL
                AND cred_refresh_token != ''
                AND cred_expires_at < ?
-               AND cred_expires_at > ?
                AND status != 'error'
+               AND status != 'banned'
                AND (is_del = FALSE OR is_del IS NULL)
              ORDER BY cred_expires_at ASC
              LIMIT ?`,
-            [...activePoolAccountIds, threshold, now, effectiveBatchSize - retryAccounts.length],
+            [...activePoolAccountIds, threshold, effectiveBatchSize - retryAccounts.length],
             'query_expiring_accounts_active_pool'
           )
 
@@ -1192,7 +1195,9 @@ class TokenRefresher {
           console.log(`[TokenRefresher] Active pool mode: found ${rows.length} accounts to refresh (pool size: ${activePoolAccountIds.length})`)
         }
       } else {
-        // 传统模式：查找所有即将过期的账号
+        // 传统模式：查找所有即将过期或已过期的账号
+        // 只要 cred_expires_at < threshold（即将过期或已过期）就刷新
+        // 因为 cred_refresh_token 有效期很长（至少2个月），不需要下限检查
         // 排除已删除的账号（is_del = TRUE）
         const [allRows] = await this.executeWithRetry(
           conn,
@@ -1204,12 +1209,12 @@ class TokenRefresher {
              AND cred_refresh_token IS NOT NULL
              AND cred_refresh_token != ''
              AND cred_expires_at < ?
-             AND cred_expires_at > ?
              AND status != 'error'
+             AND status != 'banned'
              AND (is_del = FALSE OR is_del IS NULL)
            ORDER BY cred_expires_at ASC
            LIMIT ?`,
-          [threshold, now, effectiveBatchSize - retryAccounts.length],
+          [threshold, effectiveBatchSize - retryAccounts.length],
           'query_expiring_accounts'
         )
 

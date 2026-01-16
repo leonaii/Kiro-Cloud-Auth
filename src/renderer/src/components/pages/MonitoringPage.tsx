@@ -47,6 +47,69 @@ interface AlertSummary {
   warning: number
 }
 
+// 账号池状态类型
+interface ActivePoolAccount {
+  id: string
+  email: string
+  addedAt: number
+  errorCount: number
+  lastErrorAt: number | null
+  usagePercent: number
+}
+
+interface CoolingPoolAccount {
+  id: string
+  email: string
+  coolingStartAt: number
+  errorCount: number
+  lastError: string
+  remainingCoolingMs: number
+}
+
+interface AccountPoolData {
+  activePool: {
+    enabled: boolean
+    initialized: boolean
+    config: {
+      limit: number
+      errorThreshold: number
+      coolingPeriodMs: number
+    }
+    activePool: {
+      size: number
+      limit: number
+      accounts: ActivePoolAccount[]
+    }
+    coolingPool: {
+      size: number
+      accounts: CoolingPoolAccount[]
+    }
+    stats: {
+      promotions: number
+      demotions: number
+      recoveries: number
+      errors: number
+    }
+  }
+  cache: {
+    size: number
+    expiry: number
+    dbConnectionFailed: boolean
+  }
+  stats: {
+    cacheHits: number
+    cacheMisses: number
+    dbErrors: number
+    staleCacheUsed: number
+    validationErrors: number
+    dataRepairs: number
+    incompleteAccounts: number
+    healthScore: number
+    lastHealthCheck: number | null
+  }
+  timestamp: number
+}
+
 interface ComponentHealth {
   status: 'healthy' | 'warning' | 'critical' | 'unknown'
   latency?: number
@@ -151,6 +214,7 @@ export function MonitoringPage(): React.ReactNode {
   const [healthData, setHealthData] = useState<HealthData | null>(null)
   const [performanceData, setPerformanceData] = useState<PerformanceData | null>(null)
   const [alertsData, setAlertsData] = useState<AlertsData | null>(null)
+  const [accountPoolData, setAccountPoolData] = useState<AccountPoolData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [timeRange, setTimeRange] = useState<'last_hour' | 'last_24h' | 'last_7d'>('last_hour')
@@ -167,10 +231,11 @@ export function MonitoringPage(): React.ReactNode {
       const API_BASE = getApiBase()
 
       // 并行获取所有数据
-      const [healthRes, perfRes, alertsRes] = await Promise.all([
+      const [healthRes, perfRes, alertsRes, poolRes] = await Promise.all([
         fetchWithAuth(`${API_BASE}/monitoring/health`),
         fetchWithAuth(`${API_BASE}/monitoring/performance?timeRange=${timeRange}`),
-        fetchWithAuth(`${API_BASE}/monitoring/alerts?limit=20`)
+        fetchWithAuth(`${API_BASE}/monitoring/alerts?limit=20`),
+        fetchWithAuth(`${API_BASE}/monitoring/account-pool`)
       ])
 
       if (healthRes.ok) {
@@ -186,6 +251,11 @@ export function MonitoringPage(): React.ReactNode {
       if (alertsRes.ok) {
         const alerts = await alertsRes.json()
         setAlertsData(alerts.data || alerts)
+      }
+
+      if (poolRes.ok) {
+        const pool = await poolRes.json()
+        setAccountPoolData(pool.data || pool)
       }
     } catch (err) {
       console.error('Failed to fetch monitoring data:', err)
@@ -635,6 +705,113 @@ export function MonitoringPage(): React.ReactNode {
               )}
             </CardContent>
           </Card>
+
+          {/* 账号池详细状态 */}
+          {accountPoolData && (
+            <Card className="bg-background/40 backdrop-blur-md border-white/10 shadow-lg">
+              <CardHeader className="border-b border-white/5 pb-4">
+                <CardTitle className="flex items-center gap-2 text-base font-semibold">
+                  <Server className="h-4 w-4 text-primary" />
+                  账号池状态
+                  {accountPoolData.activePool?.enabled ? (
+                    <span className="text-xs bg-green-500/10 text-green-500 px-2 py-0.5 rounded-full">已启用</span>
+                  ) : (
+                    <span className="text-xs bg-muted/10 text-muted-foreground px-2 py-0.5 rounded-full">已禁用</span>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 space-y-4">
+                {/* 活跃池 */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-foreground">活跃池</span>
+                    <span className="text-xs text-muted-foreground">
+                      {accountPoolData.activePool?.activePool?.size ?? 0} / {accountPoolData.activePool?.activePool?.limit ?? 0}
+                    </span>
+                  </div>
+                  <div className="w-full bg-muted/20 rounded-full h-2">
+                    <div
+                      className="bg-green-500 h-2 rounded-full transition-all"
+                      style={{
+                        width: `${accountPoolData.activePool?.activePool?.limit
+                          ? (accountPoolData.activePool.activePool.size / accountPoolData.activePool.activePool.limit) * 100
+                          : 0}%`
+                      }}
+                    />
+                  </div>
+                  {accountPoolData.activePool?.activePool?.accounts && accountPoolData.activePool.activePool.accounts.length > 0 && (
+                    <div className="space-y-1 mt-2">
+                      {accountPoolData.activePool.activePool.accounts.map((acc) => (
+                        <div key={acc.id} className="flex items-center justify-between text-xs p-2 bg-white/5 rounded-lg">
+                          <span className="text-foreground truncate max-w-[150px]" title={acc.email}>{acc.email}</span>
+                          <div className="flex items-center gap-2">
+                            <span className={cn(
+                              "px-1.5 py-0.5 rounded",
+                              acc.errorCount > 0 ? 'bg-amber-500/10 text-amber-500' : 'bg-green-500/10 text-green-500'
+                            )}>
+                              错误: {acc.errorCount}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {acc.usagePercent?.toFixed(1) ?? 0}%
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* 冷却池 */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-foreground">冷却池</span>
+                    <span className="text-xs text-muted-foreground">
+                      {accountPoolData.activePool?.coolingPool?.size ?? 0} 个账号
+                    </span>
+                  </div>
+                  {accountPoolData.activePool?.coolingPool?.accounts && accountPoolData.activePool.coolingPool.accounts.length > 0 && (
+                    <div className="space-y-1">
+                      {accountPoolData.activePool.coolingPool.accounts.map((acc) => (
+                        <div key={acc.id} className="flex items-center justify-between text-xs p-2 bg-amber-500/5 rounded-lg border border-amber-500/10">
+                          <span className="text-foreground truncate max-w-[120px]" title={acc.email}>{acc.email}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-amber-500">
+                              剩余: {Math.ceil((acc.remainingCoolingMs || 0) / 60000)}分钟
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {(!accountPoolData.activePool?.coolingPool?.accounts || accountPoolData.activePool.coolingPool.accounts.length === 0) && (
+                    <div className="text-xs text-muted-foreground text-center py-2">
+                      无冷却中的账号
+                    </div>
+                  )}
+                </div>
+
+                {/* 统计信息 */}
+                <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/5">
+                  <div className="text-center p-2 bg-white/5 rounded-lg">
+                    <div className="text-lg font-bold text-green-500">{accountPoolData.activePool?.stats?.promotions ?? 0}</div>
+                    <div className="text-xs text-muted-foreground">晋升次数</div>
+                  </div>
+                  <div className="text-center p-2 bg-white/5 rounded-lg">
+                    <div className="text-lg font-bold text-amber-500">{accountPoolData.activePool?.stats?.demotions ?? 0}</div>
+                    <div className="text-xs text-muted-foreground">降级次数</div>
+                  </div>
+                  <div className="text-center p-2 bg-white/5 rounded-lg">
+                    <div className="text-lg font-bold text-blue-500">{accountPoolData.activePool?.stats?.recoveries ?? 0}</div>
+                    <div className="text-xs text-muted-foreground">恢复次数</div>
+                  </div>
+                  <div className="text-center p-2 bg-white/5 rounded-lg">
+                    <div className="text-lg font-bold text-red-500">{accountPoolData.activePool?.stats?.errors ?? 0}</div>
+                    <div className="text-xs text-muted-foreground">错误次数</div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
 
           {/* 前端错误日志 */}
           {frontendErrors.length > 0 && (

@@ -33,8 +33,8 @@ import {
   monitoringRoutes
 } from './routes/index.js'
 
-// 监控模块的 TokenRefresher 设置函数
-import { setTokenRefresher as setMonitoringTokenRefresher } from './routes/monitoring.js'
+// 监控模块的 TokenRefresher 和 AccountPool 设置函数
+import { setTokenRefresher as setMonitoringTokenRefresher, setAccountPool as setMonitoringAccountPool } from './routes/monitoring.js'
 
 // 登录认证
 import authRoutes from './routes/auth.js'
@@ -369,6 +369,9 @@ async function start() {
     accountPool.startHealthMonitor()
     accountPool.startActivePoolMonitor()
     console.log(`✓ Account pool initialized (active pool enabled: ${accountPool.activePoolConfig.enabled}, limit: ${accountPool.activePoolConfig.limit})`)
+
+    // 将 accountPool 实例传递给监控模块
+    setMonitoringAccountPool(accountPool)
 
     // 启动 Token 自动刷新服务（可通过环境变量禁用）
     const disableTokenRefresh = process.env.DISABLE_TOKEN_REFRESH === 'true'
