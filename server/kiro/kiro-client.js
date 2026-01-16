@@ -211,17 +211,69 @@ class KiroClient {
     return request
   }
 
+  /**
+   * 获取消息的文本内容
+   * 支持多模态内容（文本 + 图片 + 工具调用）
+   */
   getContentText(message) {
     if (!message) return ''
     if (typeof message === 'string') return message
     if (typeof message.content === 'string') return message.content
     if (Array.isArray(message.content)) {
-      return message.content
-        .filter(p => p.type === 'text')
-        .map(p => p.text)
-        .join('')
+      const parts = []
+      for (const block of message.content) {
+        if (block.type === 'text') {
+          parts.push(block.text)
+        } else if (block.type === 'tool_result') {
+          // 工具结果
+          parts.push(`[Tool Result ${block.tool_use_id}]: ${typeof block.content === 'string' ? block.content : JSON.stringify(block.content)}`)
+        } else if (block.type === 'tool_use') {
+          // 工具调用（assistant 消息中）
+          parts.push(`[Tool Call ${block.id}]: ${block.name}(${JSON.stringify(block.input)})`)
+        }
+        // 图片块不转换为文本，但会在 buildRequest 中单独处理
+      }
+      return parts.join('\n')
     }
     return String(message.content || message)
+  }
+
+  /**
+   * 获取消息的完整内容块（包括图片）
+   * 用于构建 Kiro 请求
+   */
+  getContentBlocks(message) {
+    if (!message) return []
+    if (typeof message === 'string') return [{ type: 'text', text: message }]
+    if (typeof message.content === 'string') return [{ type: 'text', text: message.content }]
+    if (Array.isArray(message.content)) {
+      return message.content.map(block => {
+        if (block.type === 'text') {
+          return { type: 'text', text: block.text }
+        } else if (block.type === 'image') {
+          // 图片块
+          return {
+            type: 'image',
+            source: block.source
+          }
+        } else if (block.type === 'tool_result') {
+          return {
+            type: 'tool_result',
+            tool_use_id: block.tool_use_id,
+            content: block.content
+          }
+        } else if (block.type === 'tool_use') {
+          return {
+            type: 'tool_use',
+            id: block.id,
+            name: block.name,
+            input: block.input
+          }
+        }
+        return block
+      })
+    }
+    return [{ type: 'text', text: String(message.content || message) }]
   }
 
   mergeContent(content1, content2) {
@@ -232,10 +284,12 @@ class KiroClient {
 
   /**
    * 解析响应
+   * 支持文本内容、thinking 块和工具调用
    */
   parseResponse(rawData) {
     const rawStr = Buffer.isBuffer(rawData) ? rawData.toString('utf8') : String(rawData)
     let fullContent = ''
+    const toolCalls = []
 
     // Kiro API 返回的是多个 JSON 对象拼接在一起，每个包含 {"content":"..."}
     let pos = 0
@@ -282,12 +336,36 @@ class KiroClient {
       }
     }
 
-    // 提取 thinking 块
+    // 提取 thinking 块和工具调用
     const contentBlocks = extractThinkingFromContent(fullContent)
 
+    // 解析工具调用（格式：<tool_use>{"id":"...","name":"...","input":{...}}</tool_use>）
+    const toolUseRegex = /<tool_use>([\s\S]*?)<\/tool_use>/g
+    let toolMatch
+    while ((toolMatch = toolUseRegex.exec(fullContent)) !== null) {
+      try {
+        const toolData = JSON.parse(toolMatch[1])
+        toolCalls.push({
+          type: 'tool_use',
+          id: toolData.id || `tool_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          name: toolData.name,
+          input: toolData.input || {}
+        })
+      } catch (e) {
+        console.warn('[KiroClient] Tool use parse failed:', e.message)
+      }
+    }
+
+    // 如果有工具调用，从内容中移除工具调用标签
+    let cleanContent = fullContent
+    if (toolCalls.length > 0) {
+      cleanContent = fullContent.replace(/<tool_use>[\s\S]*?<\/tool_use>/g, '').trim()
+    }
+
     return {
-      content: fullContent,
-      contentBlocks: contentBlocks  // 新增：结构化的内容块
+      content: cleanContent,
+      contentBlocks: contentBlocks,
+      toolCalls: toolCalls.length > 0 ? toolCalls : null
     }
   }
 
@@ -466,6 +544,12 @@ class KiroClient {
     let thinkingBuffer = ''
     let contentBuffer = ''
 
+    // 工具调用状态跟踪
+    let inToolUseBlock = false
+    let toolUseBuffer = ''
+    const TOOL_USE_START_TAG = '<tool_use>'
+    const TOOL_USE_END_TAG = '</tool_use>'
+
     try {
       while (true) {
         const { done, value } = await reader.read()
@@ -514,63 +598,100 @@ class KiroClient {
           try {
             const parsed = JSON.parse(jsonStr)
             if (parsed.content) {
-              const chunk = parsed.content
+              let chunk = parsed.content
 
-              // 如果启用了 thinking 模式，处理 thinking 标签
-              if (thinkingEnabled) {
-                // 将 chunk 添加到适当的缓冲区并检测标签
-                let remaining = chunk
-
-                while (remaining.length > 0) {
-                  if (!inThinkingBlock) {
-                    // 不在 thinking 块中，查找开始标签
-                    const thinkStartIdx = remaining.indexOf(THINKING_START_TAG)
-                    if (thinkStartIdx === -1) {
-                      // 没有开始标签，全部是普通内容
-                      contentBuffer += remaining
-                      if (contentBuffer.length > 0) {
-                        yield { type: 'content', content: contentBuffer }
-                        contentBuffer = ''
-                      }
-                      remaining = ''
-                    } else {
-                      // 找到开始标签
-                      if (thinkStartIdx > 0) {
-                        // 标签前有内容
-                        const beforeTag = remaining.substring(0, thinkStartIdx)
-                        yield { type: 'content', content: beforeTag }
-                      }
-                      inThinkingBlock = true
-                      remaining = remaining.substring(thinkStartIdx + THINKING_START_TAG.length)
-                      // 发送 thinking 开始事件
-                      yield { type: 'thinking_start' }
-                    }
+              // 处理工具调用标签
+              let remaining = chunk
+              while (remaining.length > 0) {
+                if (inToolUseBlock) {
+                  // 在工具调用块中，查找结束标签
+                  const toolEndIdx = remaining.indexOf(TOOL_USE_END_TAG)
+                  if (toolEndIdx === -1) {
+                    toolUseBuffer += remaining
+                    remaining = ''
                   } else {
-                    // 在 thinking 块中，查找结束标签
-                    const thinkEndIdx = remaining.indexOf(THINKING_END_TAG)
-                    if (thinkEndIdx === -1) {
-                      // 没有结束标签，全部是 thinking 内容
-                      thinkingBuffer += remaining
-                      yield { type: 'thinking', thinking: remaining }
-                      remaining = ''
-                    } else {
-                      // 找到结束标签
-                      if (thinkEndIdx > 0) {
-                        const thinkContent = remaining.substring(0, thinkEndIdx)
-                        thinkingBuffer += thinkContent
-                        yield { type: 'thinking', thinking: thinkContent }
+         toolUseBuffer += remaining.substring(0, toolEndIdx)
+                    inToolUseBlock = false
+                    // 解析并发送工具调用事件
+                    try {
+                      const toolData = JSON.parse(toolUseBuffer)
+                      yield {
+                        type: 'tool_use',
+                        id: toolData.id || `tool_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                        name: toolData.name,
+                        input: toolData.input || {}
                       }
-                      inThinkingBlock = false
-                      // 发送 thinking 结束事件
-                      yield { type: 'thinking_end', thinking: thinkingBuffer }
-                      thinkingBuffer = ''
-                      remaining = remaining.substring(thinkEndIdx + THINKING_END_TAG.length)
+                    } catch (e) {
+                      console.warn('[KiroClient] Tool use parse failed:', e.message)
                     }
+                    toolUseBuffer = ''
+                    remaining = remaining.substring(toolEndIdx + TOOL_USE_END_TAG.length)
+                  }
+                } else {
+                  // 不在工具调用块中，查找开始标签
+                  const toolStartIdx = remaining.indexOf(TOOL_USE_START_TAG)
+                  if (toolStartIdx === -1) {
+                    // 没有工具调用标签，处理普通内容
+                    if (thinkingEnabled) {
+                      // 处理 thinking 标签
+                      let thinkRemaining = remaining
+                      while (thinkRemaining.length > 0) {
+                        if (!inThinkingBlock) {
+                          const thinkStartIdx = thinkRemaining.indexOf(THINKING_START_TAG)
+                          if (thinkStartIdx === -1) {
+                            contentBuffer += thinkRemaining
+                            if (contentBuffer.length > 0) {
+                              yield { type: 'content', content: contentBuffer }
+                              contentBuffer = ''
+                            }
+                            thinkRemaining = ''
+                          } else {
+                            if (thinkStartIdx > 0) {
+                              yield { type: 'content', content: thinkRemaining.substring(0, thinkStartIdx) }
+                            }
+                            inThinkingBlock = true
+                            thinkRemaining = thinkRemaining.substring(thinkStartIdx + THINKING_START_TAG.length)
+                            yield { type: 'thinking_start' }
+                          }
+                        } else {
+                          const thinkEndIdx = thinkRemaining.indexOf(THINKING_END_TAG)
+                          if (thinkEndIdx === -1) {
+                            thinkingBuffer += thinkRemaining
+                            yield { type: 'thinking', thinking: thinkRemaining }
+                            thinkRemaining = ''
+                          } else {
+                            if (thinkEndIdx > 0) {
+                              const thinkContent = thinkRemaining.substring(0, thinkEndIdx)
+                              thinkingBuffer += thinkContent
+                              yield { type: 'thinking', thinking: thinkContent }
+                            }
+                            inThinkingBlock = false
+                            yield { type: 'thinking_end', thinking: thinkingBuffer }
+                            thinkingBuffer = ''
+                            thinkRemaining = thinkRemaining.substring(thinkEndIdx + THINKING_END_TAG.length)
+                          }
+                        }
+                      }
+                    } else {
+                      yield { type: 'content', content: remaining }
+                    }
+                    remaining = ''
+                  } else {
+                    // 找到工具调用开始标签
+                    if (toolStartIdx > 0) {
+                      // 标签前有内容，先处理
+                      const beforeTool = remaining.substring(0, toolStartIdx)
+                      if (thinkingEnabled) {
+                        // 简化处理：直接输出
+                        yield { type: 'content', content: beforeTool }
+                      } else {
+                        yield { type: 'content', content: beforeTool }
+                      }
+                    }
+                    inToolUseBlock = true
+                    remaining = remaining.substring(toolStartIdx + TOOL_USE_START_TAG.length)
                   }
                 }
-              } else {
-                // 未启用 thinking 模式，直接输出
-                yield { type: 'content', content: chunk }
               }
             }
           } catch (e) {

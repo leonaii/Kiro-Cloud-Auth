@@ -12,7 +12,7 @@ import { validateApiKey } from './auth-middleware.js'
 import { getClientIp } from '../utils/request-utils.js'
 import { delay, isRetryableError } from '../utils/retry-utils.js'
 import { convertMessages, extractSystemPrompt, estimateTokens } from './openai-converter.js'
-import { buildOpenAIResponse, buildStreamChunk } from './openai-response.js'
+import { buildOpenAIResponse, buildStreamChunk, buildToolCallChunk } from './openai-response.js'
 
 const router = Router()
 let accountPool = null
@@ -302,6 +302,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
       let thinkingContent = ''  // 累积 thinking 内容
       let isFirstChunk = true   // 跟踪是否为首个 chunk
       let timeToFirstByte = null  // 首字响应时间
+      let toolCalls = []  // 累积工具调用
+      let hasToolCalls = false  // 是否有工具调用
 
       try {
         for await (const event of streamResult.stream) {
@@ -328,6 +330,17 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           } else if (event.type === 'thinking_end') {
             // Thinking 结束，可选：发送结束标记
             // 这里不发送额外内容，thinking 内容已经通过 thinking 事件发送
+          } else if (event.type === 'tool_use') {
+            // 工具调用事件
+            hasToolCalls = true
+            toolCalls.push({
+              id: event.id,
+              name: event.name,
+              input: event.input
+            })
+            // 发送工具调用 chunk
+            res.write(buildToolCallChunk(event.id, event.name, event.input, model, isFirstChunk))
+            isFirstChunk = false
           } else if (event.type === 'token_refreshed' && event.newTokens) {
             // Token 刷新成功，更新数据库
             const expiresAt = Date.now() + (event.newTokens.expiresIn || 3600) * 1000
@@ -341,7 +354,8 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           }
         }
 
-        res.write(buildStreamChunk('', model, 'stop'))
+        // 发送结束 chunk，如果有工具调用则 finish_reason 为 'tool_calls'
+        res.write(buildStreamChunk('', model, hasToolCalls ? 'tool_calls' : 'stop'))
         res.write('data: [DONE]\n\n')
 
         const outputTokens = estimateTokens(fullContent)
@@ -569,14 +583,15 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           requestHeaders: kiroHeaders
         })
 
-        // 传递 contentBlocks 以支持 thinking 内容
+        // 传递 contentBlocks 和 toolCalls 以支持 thinking 内容和工具调用
         res.json(buildOpenAIResponse(
           result.parsed.content,
           model,
           inputTokens,
           outputTokens,
           'stop',
-          result.parsed.contentBlocks
+          result.parsed.contentBlocks,
+          result.parsed.toolCalls
         ))
       } catch (error) {
         console.error('[OpenAI API] Error:', error.message)
