@@ -12,6 +12,7 @@
  * - 动态并发控制
  * - 详细的数据库操作统计
  * - 分布式锁：防止多实例同时刷新同一账号
+ * - 工作时段控制：非工作时段暂停刷新
  */
 
 import { randomUUID } from 'crypto'
@@ -27,6 +28,9 @@ import { withLock, LockNames, getLockStats } from './utils/distributed-lock.js'
 
 // 引用告警类型
 import { AlertType, AlertSeverity } from './openai-compat/system-logger.js'
+
+// 引用工作时段检查工具
+import { getWorkingStatus } from './utils/working-hours.js'
 
 const TOKEN_REFRESH_MIN_BEFORE_EXPIRY = 10 * 60 * 1000 // 最少提前 10 分钟刷新
 const TOKEN_REFRESH_MAX_BEFORE_EXPIRY = 16 * 60 * 1000 // 最多提前 16 分钟刷新
@@ -1123,6 +1127,21 @@ class TokenRefresher {
     }
     if (this.isShuttingDown) {
       console.log('[TokenRefresher] Shutting down, skipping refresh...')
+      return
+    }
+
+    // 获取完整的工作状态
+    const status = getWorkingStatus()
+
+    // 检查是否在工作时段内
+    if (!status.isInWorkingHours) {
+      console.log(`[TokenRefresher] ${status.message}，跳过 Token 刷新`)
+      return
+    }
+
+    // 检查是否为非工作日且配置了跳过
+    if (!status.isWorkday && status.skipOnHoliday) {
+      console.log(`[TokenRefresher] 今天是非工作日（${status.date}），跳过 Token 刷新`)
       return
     }
 

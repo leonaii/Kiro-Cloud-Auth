@@ -12,6 +12,7 @@ import { validateApiKey } from '../openai-compat/auth-middleware.js'
 import { generateHeaders } from '../utils/header-generator.js'
 import { getClientIp, sanitizeHeaders } from '../utils/request-utils.js'
 import { isRetryableError, isQuotaExhaustedError, isBannedError } from '../utils/retry-utils.js'
+import { checkWorkingHours, buildNonWorkingHoursError, getWorkingStatus } from '../utils/working-hours.js'
 import {
   estimateTokens,
   estimateInputTokens,
@@ -70,6 +71,13 @@ router.post('/v1/messages', validateApiKey, validateAnthropicVersion, async (req
   const startTime = Date.now()
   const clientIp = getClientIp(req)
   const userAgent = req.headers['user-agent']
+
+  // 检查是否在工作时段内（包含工作日判断）
+  const status = getWorkingStatus()
+  if (!status.isServiceAvailable) {
+    const error = buildNonWorkingHoursError('claude')
+    return res.status(error.status).json(error.body)
+  }
 
   const {
     model = 'claude-sonnet-4-5',
@@ -230,11 +238,11 @@ async function handleStreamResponse(req, res, options) {
     if (isQuotaExhaustedError(error)) {
       console.log(`[Claude API] Quota exhausted (402) for account ${currentAccount.email}, marking and switching...`)
       accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
-      
+
       // 尝试切换账号重试
       if (retryCount < maxRetries && !account_id) {
         retryCount++
-        
+
         const newAccount = await accountPool.getNextAccount(groupId)
         if (newAccount && newAccount.id !== currentAccount.id) {
           console.log(`[Claude API] Retry stream with new account after 402: ${newAccount.email}`)
@@ -250,7 +258,7 @@ async function handleStreamResponse(req, res, options) {
     } else if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
       await accountPool.markAccountError(currentAccount.id)
       retryCount++
-      
+
       const newAccount = await accountPool.getNextAccount(groupId)
       if (newAccount && newAccount.id !== currentAccount.id) {
         await accountPool.incrementApiCall(newAccount.id)
@@ -409,7 +417,7 @@ async function handleStreamResponse(req, res, options) {
 
       try {
         // 获取新账号
-        
+
         const newAccount = await accountPool.getNextAccount(groupId)
 
         if (newAccount && newAccount.id !== currentAccount.id) {
@@ -637,11 +645,11 @@ async function handleNonStreamResponse(req, res, options) {
       if (isQuotaExhaustedError(error)) {
         console.log(`[Claude API] Quota exhausted (402) for account ${currentAccount.email}, marking and switching...`)
         accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
-        
+
         // 尝试切换账号重试
         if (retryCount < maxRetries && !account_id) {
           retryCount++
-          
+
           const newAccount = await accountPool.getNextAccount(groupId)
           if (newAccount && newAccount.id !== currentAccount.id) {
             console.log(`[Claude API] Retry with new account after 402: ${newAccount.email}`)
@@ -657,7 +665,7 @@ async function handleNonStreamResponse(req, res, options) {
       } else if (isRetryableError(error) && retryCount < maxRetries && !account_id) {
         await accountPool.markAccountError(currentAccount.id)
         retryCount++
-        
+
         const newAccount = await accountPool.getNextAccount(groupId)
         if (newAccount && newAccount.id !== currentAccount.id) {
           await accountPool.incrementApiCall(newAccount.id)
@@ -705,7 +713,7 @@ async function handleNonStreamResponse(req, res, options) {
     res.json(response)
   } catch (error) {
     console.error('[Claude API] Error:', error.message)
-    
+
     // 检查是否为封禁错误（Bad credentials 或 BANNED:TEMPORARILY_SUSPENDED）
     if (isBannedError(error)) {
       // 封禁错误：永久移除账号并标记为封禁状态
@@ -716,7 +724,7 @@ async function handleNonStreamResponse(req, res, options) {
     } else if (isRetryableError(error)) {
       await accountPool.markAccountError(currentAccount.id)
     }
-    
+
     // 确定状态码和错误类型
     let statusCode = 500
     let errorType = 'api_error'

@@ -20,6 +20,7 @@ class KiroClient {
     this.authMethod = account.credentials.authMethod
     this.clientId = account.credentials.clientId
     this.clientSecret = account.credentials.clientSecret
+    this.profileArn = account.credentials.profileArn  // 添加 profileArn
     this.headerVersion = account.headerVersion || 1
     this.systemLogger = systemLogger
 
@@ -387,6 +388,11 @@ class KiroClient {
 
     if (history.length > 0) {
       request.conversationState.history = history
+    }
+
+    // 如果是 social 认证方式，添加 profileArn
+    if (this.authMethod === 'social' && this.profileArn) {
+      request.profileArn = this.profileArn
     }
 
     return request

@@ -39,7 +39,7 @@ ACTIVE_POOL_ENABLED=true
 # 活跃池上限（默认 5）
 # 活跃池中最多保持的账号数量，建议根据并发量设置
 ACTIVE_POOL_LIMIT=5
-MAX_ACCOUNT_RETRIES = 5
+MAX_ACCOUNT_RETRIES=5
 
 # 异常累计阈值（默认 5）
 # 当活跃池中的账号累计错误次数达到此阈值时，会被移入冷却池
@@ -53,4 +53,6 @@ ACTIVE_POOL_COOLING_PERIOD_MS=3600000
 # 设为 true 时，只刷新活跃池中账号的 Token
 # 设为 false 时，刷新所有即将过期的账号 Token
 TOKEN_REFRESH_ACTIVE_POOL_ONLY=true
-ENABLE_CLAUDE_API = true
+ENABLE_CLAUDE_API=true
+WORKING_HOURS=8-24
+SKIP_REFRESH_ON_HOLIDAY=true

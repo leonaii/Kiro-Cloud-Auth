@@ -13,6 +13,7 @@ import { getClientIp } from '../utils/request-utils.js'
 import { isRetryableError, isQuotaExhaustedError, isBannedError } from '../utils/retry-utils.js'
 import { convertMessages, extractSystemPrompt, estimateTokens } from './openai-converter.js'
 import { buildOpenAIResponse, buildStreamChunk, buildToolCallChunk } from './openai-response.js'
+import { checkWorkingHours, buildNonWorkingHoursError, getWorkingStatus } from '../utils/working-hours.js'
 
 const router = Router()
 let accountPool = null
@@ -95,6 +96,13 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
   const startTime = Date.now()
   const clientIp = getClientIp(req)
   const userAgent = req.headers['user-agent']
+
+  // 检查是否在工作时段内（包含工作日判断）
+  const status = getWorkingStatus()
+  if (!status.isServiceAvailable) {
+    const error = buildNonWorkingHoursError('openai')
+    return res.status(error.status).json(error.body)
+  }
 
   const { messages, model = 'claude-sonnet-4-5', stream = false, tools, account_id } = req.body
 
@@ -274,11 +282,11 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
         if (isQuotaExhaustedError(error)) {
           console.log(`[OpenAI API] Quota exhausted (402) for account ${currentAccount.email}, marking and switching...`)
           accountPool.markAccountQuotaExhausted(currentAccount.id, error.message)
-          
+
           // 尝试切换账号重试
           if (retryCount < maxRetries && !account_id) {
             retryCount++
-            
+
             const newAccount = await accountPool.getNextAccount(groupId)
             if (newAccount && newAccount.id !== currentAccount.id) {
               console.log(`[OpenAI API] Retry stream with new account after 402: ${newAccount.email}`)
@@ -297,7 +305,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           )
           await accountPool.markAccountError(currentAccount.id)
           retryCount++
-          
+
 
           const newAccount = await accountPool.getNextAccount(groupId)
           if (newAccount && newAccount.id !== currentAccount.id) {
@@ -414,7 +422,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
 
           try {
             // 获取新账号
-            
+
             const newAccount = await accountPool.getNextAccount(groupId)
 
             if (newAccount && newAccount.id !== currentAccount.id) {
@@ -583,11 +591,11 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
           if (isQuotaExhaustedError(error)) {
             console.log(`[OpenAI API] Quota exhausted (402) for account ${account.email}, marking and switching...`)
             accountPool.markAccountQuotaExhausted(account.id, error.message)
-            
+
             // 尝试切换账号重试
             if (retryCount < maxRetries && !account_id) {
               retryCount++
-              
+
               const newAccount = await accountPool.getNextAccount(groupId)
               if (newAccount && newAccount.id !== account.id) {
                 console.log(`[OpenAI API] Retry with new account after 402: ${newAccount.email}`)
@@ -608,7 +616,7 @@ router.post('/v1/chat/completions', validateApiKey, async (req, res) => {
             retryCount++
 
             // 获取新账号重试
-            
+
 
             // 获取新账号重试
             const newAccount = await accountPool.getNextAccount(groupId)

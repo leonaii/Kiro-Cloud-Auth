@@ -55,6 +55,9 @@ import TokenRefresher from './token-refresher.js'
 // 系统日志
 import SystemLogger, { initSystemLogger } from './openai-compat/system-logger.js'
 
+// 工作时段管理
+import { initWorkdayCache, getWorkingStatus, refreshWorkdayCache } from './utils/working-hours.js'
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
@@ -178,6 +181,27 @@ app.get('/api/server-ids', async (req, res) => {
       ...requestServers.map(r => r.server_id)
     ])].sort()
     res.json({ serverIds })
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// 获取工作状态信息（工作日、工作时段等）
+app.get('/api/working-status', async (req, res) => {
+  try {
+    const status = getWorkingStatus()
+    res.json(status)
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// 手动刷新工作日缓存
+app.post('/api/working-status/refresh', async (req, res) => {
+  try {
+    await refreshWorkdayCache()
+    const status = getWorkingStatus()
+    res.json({ success: true, status })
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -361,6 +385,11 @@ async function start() {
 
     // 修复字段长度问题
     await fixClientSecretColumn()
+
+    // 初始化工作日缓存
+    await initWorkdayCache()
+    const workingStatus = getWorkingStatus()
+    console.log(`✓ Working hours initialized: ${workingStatus.isWorkday ? '工作日' : '非工作日'}, ${workingStatus.startHour}:00-${workingStatus.endHour}:00`)
 
     // 启动系统日志清理任务
     systemLogger.startCleanupTask()
