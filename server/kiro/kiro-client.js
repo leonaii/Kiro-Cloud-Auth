@@ -158,24 +158,181 @@ class KiroClient {
     for (let i = startIndex; i < mergedMessages.length - 1; i++) {
       const msg = mergedMessages[i]
       if (msg.role === 'user') {
-        history.push({
-          userInputMessage: {
-            content: this.getContentText(msg),
-            modelId: kiroModel,
-            origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
+        const userInputMessage = {
+          content: '',
+          modelId: kiroModel,
+          origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
+        }
+        const toolResults = []
+        const images = []
+
+        if (Array.isArray(msg.content)) {
+          for (const part of msg.content) {
+            if (part.type === 'text') {
+              userInputMessage.content += part.text
+            } else if (part.type === 'tool_result') {
+              toolResults.push({
+                content: [{ text: typeof part.content === 'string' ? part.content : JSON.stringify(part.content) }],
+                status: 'success',
+                toolUseId: part.tool_use_id
+              })
+            } else if (part.type === 'image' && part.source) {
+              images.push({
+                format: part.source.media_type?.split('/')[1] || 'png',
+                source: { bytes: part.source.data }
+              })
+            }
           }
-        })
+        } else {
+          userInputMessage.content = this.getContentText(msg)
+        }
+
+        // 添加图片
+        if (images.length > 0) {
+          userInputMessage.images = images
+        }
+
+        // 添加工具结果（去重）
+        if (toolResults.length > 0) {
+          const uniqueToolResults = []
+          const seenIds = new Set()
+          for (const tr of toolResults) {
+            if (!seenIds.has(tr.toolUseId)) {
+              seenIds.add(tr.toolUseId)
+              uniqueToolResults.push(tr)
+            }
+          }
+          userInputMessage.userInputMessageContext = { toolResults: uniqueToolResults }
+        }
+
+        history.push({ userInputMessage })
       } else if (msg.role === 'assistant') {
-        history.push({
-          assistantResponseMessage: { content: this.getContentText(msg) }
-        })
+        const assistantResponseMessage = { content: '' }
+        const toolUses = []
+        let thinkingText = ''
+
+        if (Array.isArray(msg.content)) {
+          for (const part of msg.content) {
+            if (part.type === 'text') {
+              assistantResponseMessage.content += part.text
+            } else if (part.type === 'thinking') {
+              thinkingText += (part.thinking ?? part.text ?? '')
+            } else if (part.type === 'tool_use') {
+              toolUses.push({
+                input: part.input,
+                name: part.name,
+                toolUseId: part.id
+              })
+            }
+          }
+        } else {
+          assistantResponseMessage.content = this.getContentText(msg)
+        }
+
+        // 将 thinking 内容包装到 content 中
+        if (thinkingText) {
+          assistantResponseMessage.content = assistantResponseMessage.content
+            ? `${THINKING_START_TAG}${thinkingText}${THINKING_END_TAG}\n\n${assistantResponseMessage.content}`
+            : `${THINKING_START_TAG}${thinkingText}${THINKING_END_TAG}`
+        }
+
+        // 添加工具调用
+        if (toolUses.length > 0) {
+          assistantResponseMessage.toolUses = toolUses
+        }
+
+        history.push({ assistantResponseMessage })
       }
     }
 
-    // 当前消息
+    // 当前消息处理
     const currentMsg = mergedMessages[mergedMessages.length - 1]
-    let currentContent = this.getContentText(currentMsg)
-    if (!currentContent) currentContent = 'Continue'
+    let currentContent = ''
+    let currentToolResults = []
+    let currentImages = []
+
+    // 如果最后一条消息是 assistant，需要将其加入 history，然后创建一个 user 类型的 currentMessage
+    // 因为 Kiro API 的 currentMessage 必须是 userInputMessage 类型
+    if (currentMsg.role === 'assistant') {
+      console.log('[KiroClient] Last message is assistant, moving it to history and creating user currentMessage')
+
+      // 构建 assistant 消息
+      const assistantResponseMessage = { content: '' }
+      const toolUses = []
+      let thinkingText = ''
+
+      if (Array.isArray(currentMsg.content)) {
+        for (const part of currentMsg.content) {
+          if (part.type === 'text') {
+            assistantResponseMessage.content += part.text
+          } else if (part.type === 'thinking') {
+            thinkingText += (part.thinking ?? part.text ?? '')
+          } else if (part.type === 'tool_use') {
+            toolUses.push({
+              input: part.input,
+              name: part.name,
+              toolUseId: part.id
+            })
+          }
+        }
+      } else {
+        assistantResponseMessage.content = this.getContentText(currentMsg)
+      }
+
+      if (thinkingText) {
+        assistantResponseMessage.content = assistantResponseMessage.content
+          ? `${THINKING_START_TAG}${thinkingText}${THINKING_END_TAG}\n\n${assistantResponseMessage.content}`
+          : `${THINKING_START_TAG}${thinkingText}${THINKING_END_TAG}`
+      }
+
+      if (toolUses.length > 0) {
+        assistantResponseMessage.toolUses = toolUses
+      }
+
+      history.push({ assistantResponseMessage })
+      // 设置 currentContent 为 "Continue"，因为我们需要一个 user 消息来触发 AI 继续
+      currentContent = 'Continue'
+    } else {
+      // 最后一条消息是 user
+      // Kiro API 要求 history 必须以 assistantResponseMessage 结尾
+      if (history.length > 0) {
+        const lastHistoryItem = history[history.length - 1]
+        if (!lastHistoryItem.assistantResponseMessage) {
+          // 最后一个不是 assistantResponseMessage，需要补全一个空的
+          console.log('[KiroClient] History does not end with assistantResponseMessage, adding empty one')
+          history.push({
+            assistantResponseMessage: { content: 'Continue' }
+          })
+        }
+      }
+
+      // 处理 user 消息内容
+      if (Array.isArray(currentMsg.content)) {
+        for (const part of currentMsg.content) {
+          if (part.type === 'text') {
+            currentContent += part.text
+          } else if (part.type === 'tool_result') {
+            currentToolResults.push({
+              content: [{ text: typeof part.content === 'string' ? part.content : JSON.stringify(part.content) }],
+              status: 'success',
+              toolUseId: part.tool_use_id
+            })
+          } else if (part.type === 'image' && part.source) {
+            currentImages.push({
+              format: part.source.media_type?.split('/')[1] || 'png',
+              source: { bytes: part.source.data }
+            })
+          }
+        }
+      } else {
+        currentContent = this.getContentText(currentMsg)
+      }
+    }
+
+    // Kiro API 要求 content 不能为空，即使有 toolResults
+    if (!currentContent) {
+      currentContent = currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue'
+    }
 
     const request = {
       conversationState: {
@@ -191,21 +348,45 @@ class KiroClient {
       }
     }
 
-    if (history.length > 0) {
-      request.conversationState.history = history
+    // 添加图片到当前消息
+    if (currentImages.length > 0) {
+      request.conversationState.currentMessage.userInputMessage.images = currentImages
     }
 
-    // 添加工具（处理名称和描述的截断）
-    if (tools && tools.length > 0) {
-      request.conversationState.currentMessage.userInputMessage.userInputMessageContext = {
-        tools: tools.map(tool => ({
-          toolSpecification: {
-            name: shortenToolNameIfNeeded(tool.function?.name || tool.name),
-            description: processToolDescription(tool.function?.description || tool.description || ''),
-            inputSchema: { json: tool.function?.parameters || tool.parameters || {} }
-          }
-        }))
+    // 构建 userInputMessageContext
+    const userInputMessageContext = {}
+
+    // 添加工具结果（去重）
+    if (currentToolResults.length > 0) {
+      const uniqueToolResults = []
+      const seenToolUseIds = new Set()
+      for (const tr of currentToolResults) {
+        if (!seenToolUseIds.has(tr.toolUseId)) {
+          seenToolUseIds.add(tr.toolUseId)
+          uniqueToolResults.push(tr)
+        }
       }
+      userInputMessageContext.toolResults = uniqueToolResults
+    }
+
+    // 添加工具定义（处理名称和描述的截断）
+    if (tools && tools.length > 0) {
+      userInputMessageContext.tools = tools.map(tool => ({
+        toolSpecification: {
+          name: shortenToolNameIfNeeded(tool.function?.name || tool.name),
+          description: processToolDescription(tool.function?.description || tool.description || ''),
+          inputSchema: { json: tool.function?.parameters || tool.parameters || {} }
+        }
+      }))
+    }
+
+    // 只有当 userInputMessageContext 有内容时才添加
+    if (Object.keys(userInputMessageContext).length > 0) {
+      request.conversationState.currentMessage.userInputMessage.userInputMessageContext = userInputMessageContext
+    }
+
+    if (history.length > 0) {
+      request.conversationState.history = history
     }
 
     return request
