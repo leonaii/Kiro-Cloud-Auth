@@ -46,6 +46,9 @@ const MAX_DELAY_MS = 5000 // 最大延迟 5 秒
 // 使用量刷新最小间隔（5分钟）
 const USAGE_REFRESH_MIN_INTERVAL = 5 * 60 * 1000 // 5分钟
 
+// Token刷新最小间隔（防止多实例重复刷新同一账号）
+const TOKEN_REFRESH_MIN_INTERVAL = 2 * 60 * 1000 // 2分钟
+
 // 重试配置
 const MAX_RETRY_ATTEMPTS = 3 // 最大重试次数
 const RETRY_DELAYS = {
@@ -680,6 +683,38 @@ class TokenRefresher {
   async refreshSingleAccount(conn, account, retryAttempt = 0) {
     const { id, email, idp: accountIdp } = account
 
+    // 在获取锁之前先检查最小刷新间隔（防止多实例重复刷新）
+    const [lastRefreshRows] = await conn.query(
+      'SELECT last_checked_at FROM accounts WHERE id = ?',
+      [id]
+    )
+
+    const lastCheckedAt = lastRefreshRows[0]?.last_checked_at || 0
+    const timeSinceLastRefresh = Date.now() - lastCheckedAt
+
+    if (timeSinceLastRefresh < TOKEN_REFRESH_MIN_INTERVAL) {
+      const remainingTime = Math.ceil((TOKEN_REFRESH_MIN_INTERVAL - timeSinceLastRefresh) / 1000)
+      console.log(`[TokenRefresher] Skipping ${email}: refreshed ${Math.floor(timeSinceLastRefresh / 1000)}s ago (min interval: ${TOKEN_REFRESH_MIN_INTERVAL / 1000}s, remaining: ${remainingTime}s)`)
+
+      if (this.systemLogger) {
+        await this.systemLogger.logTokenRefresh({
+          accountId: id,
+          accountEmail: email,
+          accountIdp,
+          success: false,
+          message: `跳过刷新: 距上次刷新仅 ${Math.floor(timeSinceLastRefresh / 1000)}s (最小间隔: ${TOKEN_REFRESH_MIN_INTERVAL / 1000}s)`,
+          details: {
+            timeSinceLastRefresh: Math.floor(timeSinceLastRefresh / 1000),
+            minInterval: TOKEN_REFRESH_MIN_INTERVAL / 1000,
+            skipped: true,
+            reason: 'min_interval_not_met_pre_lock'
+          }
+        }).catch(() => {})
+      }
+
+      return { success: false, error: 'Minimum refresh interval not met', skipped: true }
+    }
+
     // 使用分布式锁保护刷新操作
     const lockName = LockNames.tokenRefresh(id)
     const lockStartTime = Date.now()
@@ -742,6 +777,38 @@ class TokenRefresher {
       cred_auth_method,
       cred_provider
     } = account
+
+    // 检查是否在最小刷新间隔内（防止多实例重复刷新）
+    const [lastRefreshRows] = await conn.query(
+      'SELECT last_checked_at FROM accounts WHERE id = ?',
+      [id]
+    )
+
+    const lastCheckedAt = lastRefreshRows[0]?.last_checked_at || 0
+    const timeSinceLastRefresh = Date.now() - lastCheckedAt
+
+    if (timeSinceLastRefresh < TOKEN_REFRESH_MIN_INTERVAL) {
+      const remainingTime = Math.ceil((TOKEN_REFRESH_MIN_INTERVAL - timeSinceLastRefresh) / 1000)
+      console.log(`[TokenRefresher] Skipping ${email}: refreshed ${Math.floor(timeSinceLastRefresh / 1000)}s ago (min interval: ${TOKEN_REFRESH_MIN_INTERVAL / 1000}s, remaining: ${remainingTime}s)`)
+
+      if (this.systemLogger) {
+        await this.systemLogger.logTokenRefresh({
+          accountId: id,
+          accountEmail: email,
+          accountIdp,
+          success: false,
+          message: `跳过刷新: 距上次刷新仅 ${Math.floor(timeSinceLastRefresh / 1000)}s (最小间隔: ${TOKEN_REFRESH_MIN_INTERVAL / 1000}s)`,
+          details: {
+            timeSinceLastRefresh: Math.floor(timeSinceLastRefresh / 1000),
+            minInterval: TOKEN_REFRESH_MIN_INTERVAL / 1000,
+            skipped: true,
+            reason: 'min_interval_not_met'
+          }
+        }).catch(() => {})
+      }
+
+      return { success: false, error: 'Minimum refresh interval not met', skipped: true }
+    }
 
     // 更新统计
     this.stats.totalRefreshes++
