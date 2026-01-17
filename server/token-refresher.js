@@ -43,6 +43,9 @@ const MAX_EXPIRES_IN = 2 * 60 * 60 // 最大合理过期时间 2 小时（秒）
 const MIN_DELAY_MS = 1000 // 最小延迟 1 秒
 const MAX_DELAY_MS = 5000 // 最大延迟 5 秒
 
+// 使用量刷新最小间隔（5分钟）
+const USAGE_REFRESH_MIN_INTERVAL = 5 * 60 * 1000 // 5分钟
+
 // 重试配置
 const MAX_RETRY_ATTEMPTS = 3 // 最大重试次数
 const RETRY_DELAYS = {
@@ -954,40 +957,18 @@ class TokenRefresher {
 
       // 如果启用了自动刷新使用量，在 token 刷新成功后获取使用量
       if (AUTO_REFRESH_USAGE_AFTER_TOKEN) {
-        // 等待 1-3 秒后获取使用量
-        const delayMs = Math.floor(Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS + 1)) + MIN_DELAY_MS
-        console.log(`[TokenRefresher] Waiting ${delayMs}ms before fetching usage for ${email}...`)
-        await this.sleep(delayMs)
+        // 检查上次刷新时间，如果距离上次刷新 < 5 分钟，则跳过
+        const [usageRows] = await conn.query(
+          'SELECT usage_last_updated FROM accounts WHERE id = ?',
+          [id]
+        )
 
-        try {
-          const usageResult = await getUsageLimits(result.accessToken, machineId)
-          const parsed = parseUsageResponse(usageResult)
-          const now = Date.now()
+        const lastUpdated = usageRows[0]?.usage_last_updated || 0
+        const timeSinceLastUpdate = Date.now() - lastUpdated
 
-          // 更新数据库中的使用量和订阅信息（包含完整的资源包明细）
-          // 注意：parseUsageResponse 返回的数据在 data 属性中
-          const usageData = parsed.data
-          await conn.query(
-            `UPDATE accounts SET
-              usage_current = ?, usage_limit = ?, usage_percent_used = ?, usage_last_updated = ?,
-              usage_base_limit = ?, usage_base_current = ?,
-              usage_free_trial_limit = ?, usage_free_trial_current = ?, usage_free_trial_expiry = ?,
-              usage_bonuses = ?, usage_next_reset_date = ?,
-              sub_type = ?, sub_title = ?, sub_days_remaining = ?, sub_expires_at = ?,
-              sub_raw_type = ?, sub_upgrade_capability = ?, sub_overage_capability = ?, sub_management_target = ?
-             WHERE id = ?`,
-            [
-              usageData.usage.current, usageData.usage.limit, usageData.usage.percentUsed, now,
-              usageData.usage.baseLimit, usageData.usage.baseCurrent,
-              usageData.usage.freeTrialLimit, usageData.usage.freeTrialCurrent, usageData.usage.freeTrialExpiry,
-              JSON.stringify(usageData.usage.bonuses || []), usageData.usage.nextResetDate,
-              usageData.subscription.type, usageData.subscription.title, usageData.subscription.daysRemaining, usageData.subscription.expiresAt,
-              usageData.subscription.rawType, usageData.subscription.upgradeCapability, usageData.subscription.overageCapability, usageData.subscription.managementTarget,
-              id
-            ]
-          )
-
-          console.log(`[TokenRefresher] ✓ Usage updated for ${email}: ${usageData.usage.current}/${usageData.usage.limit}`)
+        if (timeSinceLastUpdate < USAGE_REFRESH_MIN_INTERVAL) {
+          const remainingTime = Math.ceil((USAGE_REFRESH_MIN_INTERVAL - timeSinceLastUpdate) / 1000)
+          console.log(`[TokenRefresher] ⏭ Skipping usage refresh for ${email}: last updated ${Math.floor(timeSinceLastUpdate / 1000)}s ago (min interval: ${USAGE_REFRESH_MIN_INTERVAL / 1000}s, remaining: ${remainingTime}s)`)
 
           if (this.systemLogger) {
             await this.systemLogger.logSystem({
@@ -995,34 +976,93 @@ class TokenRefresher {
               accountId: id,
               accountEmail: email,
               accountIdp,
-              message: `使用量刷新成功: ${usageData.usage.current}/${usageData.usage.limit}`,
-              details: { usage: usageData.usage },
+              message: `使用量刷新跳过: 距上次刷新仅 ${Math.floor(timeSinceLastUpdate / 1000)}s (最小间隔: ${USAGE_REFRESH_MIN_INTERVAL / 1000}s)`,
+              details: {
+                timeSinceLastUpdate: Math.floor(timeSinceLastUpdate / 1000),
+                minInterval: USAGE_REFRESH_MIN_INTERVAL / 1000,
+                skipped: true
+              },
               level: 'info'
             }).catch(() => {})
           }
-        } catch (usageError) {
-          const usageErrorMsg = usageError instanceof Error ? usageError.message : String(usageError)
-          console.warn(`[TokenRefresher] ⚠ Failed to fetch usage for ${email}: ${usageErrorMsg}`)
+        } else {
+          // 等待 1-3 秒后获取使用量
+          const delayMs = Math.floor(Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS + 1)) + MIN_DELAY_MS
+          console.log(`[TokenRefresher] Waiting ${delayMs}ms before fetching usage for ${email}...`)
+          await this.sleep(delayMs)
 
-          // 检查是否被封禁
-          if (usageErrorMsg.startsWith('BANNED:')) {
-            console.error(`[TokenRefresher] Account ${email} is BANNED: ${usageErrorMsg}`)
+          try {
+            const usageResult = await getUsageLimits(result.accessToken, machineId)
+            const parsed = parseUsageResponse(usageResult)
+            const now = Date.now()
+
+            // 更新数据库中的使用量和订阅信息（包含完整的资源包明细）
+            // 注意：parseUsageResponse 返回的数据在 data 属性中
+            const usageData = parsed.data
             await conn.query(
-              `UPDATE accounts SET status = 'banned', last_checked_at = ? WHERE id = ?`,
-              [Date.now(), id]
+              `UPDATE accounts SET
+                usage_current = ?, usage_limit = ?, usage_percent_used = ?, usage_last_updated = ?,
+                usage_base_limit = ?, usage_base_current = ?,
+                usage_free_trial_limit = ?, usage_free_trial_current = ?, usage_free_trial_expiry = ?,
+                usage_bonuses = ?, usage_next_reset_date = ?,
+                sub_type = ?, sub_title = ?, sub_days_remaining = ?, sub_expires_at = ?,
+                sub_raw_type = ?, sub_upgrade_capability = ?, sub_overage_capability = ?, sub_management_target = ?
+               WHERE id = ?`,
+              [
+                usageData.usage.current, usageData.usage.limit, usageData.usage.percentUsed, now,
+                usageData.usage.baseLimit, usageData.usage.baseCurrent,
+                usageData.usage.freeTrialLimit, usageData.usage.freeTrialCurrent, usageData.usage.freeTrialExpiry,
+                JSON.stringify(usageData.usage.bonuses || []), usageData.usage.nextResetDate,
+                usageData.subscription.type, usageData.subscription.title, usageData.subscription.daysRemaining, usageData.subscription.expiresAt,
+                usageData.subscription.rawType, usageData.subscription.upgradeCapability, usageData.subscription.overageCapability, usageData.subscription.managementTarget,
+                id
+              ]
             )
-          }
 
-          if (this.systemLogger) {
-            await this.systemLogger.logSystem({
-              action: 'usage_refresh',
-              accountId: id,
-              accountEmail: email,
-              accountIdp,
-              message: `使用量刷新失败: ${usageErrorMsg}`,
-              details: { error: usageErrorMsg },
-              level: 'warn'
-            }).catch(() => {})
+            console.log(`[TokenRefresher] ✓ Usage updated for ${email}: ${usageData.usage.current}/${usageData.usage.limit}`)
+
+            if (this.systemLogger) {
+              await this.systemLogger.logSystem({
+                action: 'usage_refresh',
+                accountId: id,
+                accountEmail: email,
+                accountIdp,
+                message: `使用量刷新成功: ${usageData.usage.current}/${usageData.usage.limit}`,
+                details: { usage: usageData.usage },
+                level: 'info'
+              }).catch(() => {})
+            }
+          } catch (usageError) {
+            const usageErrorMsg = usageError instanceof Error ? usageError.message : String(usageError)
+            console.warn(`[TokenRefresher] ⚠ Failed to fetch usage for ${email}: ${usageErrorMsg}`)
+
+            // 检查是否被封禁
+            if (usageErrorMsg.startsWith('BANNED:')) {
+              console.error(`[TokenRefresher] Account ${email} is BANNED: ${usageErrorMsg}`)
+
+              // 更新数据库状态
+              await conn.query(
+                `UPDATE accounts SET status = 'banned', last_error = ?, last_checked_at = ? WHERE id = ?`,
+                [usageErrorMsg, Date.now(), id]
+              )
+
+              // 从账号池中永久移除（如果启用了活跃池）
+              if (this.accountPool) {
+                await this.accountPool.banAccount(id, usageErrorMsg)
+              }
+            }
+
+            if (this.systemLogger) {
+              await this.systemLogger.logSystem({
+                action: 'usage_refresh',
+                accountId: id,
+                accountEmail: email,
+                accountIdp,
+                message: `使用量刷新失败: ${usageErrorMsg}`,
+                details: { error: usageErrorMsg },
+                level: usageErrorMsg.startsWith('BANNED:') ? 'error' : 'warn'
+              }).catch(() => {})
+            }
           }
         }
       }

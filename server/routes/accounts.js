@@ -79,27 +79,27 @@ router.post('/api/accounts/:id', async (req, res) => {
   try {
     const acc = { ...req.body, id: req.params.id }
     const accountId = req.params.id
-    
+
     // 检查是否是新增账号（通过查询是否已存在）
     const [existingRows] = await conn.query('SELECT id FROM accounts WHERE id = ?', [accountId])
     const isNewAccount = existingRows.length === 0
-    
+
     await insertAccount(conn, accountId, acc)
     res.json({ success: true })
-    
+
     // 如果是新增账号，异步获取使用量信息（不阻塞响应）
     if (isNewAccount && acc.credentials?.accessToken) {
       // 使用 setImmediate 确保响应先发送
       setImmediate(async () => {
         try {
           console.log(`[API] New account added: ${acc.email}, fetching usage info...`)
-          
+
           // 获取或创建机器码（使用提取的公共函数）
           const machineId = await getOrCreateMachineId(null, accountId)
-          
+
           // 确定 idp（使用提取的公共函数）
           const idp = determineIdp(acc.credentials, acc.idp)
-          
+
           // 构造账号对象用于 API 调用
           const accountForApi = {
             headerVersion: acc.headerVersion || 1,
@@ -110,20 +110,20 @@ router.post('/api/accounts/:id', async (req, res) => {
             ideVersion: acc.ideVersion,
             credentials: acc.credentials
           }
-          
+
           // 调用 API 获取使用量
           const usageResult = await getUsageLimits(acc.credentials.accessToken, accountForApi)
           const parsed = parseUsageResponse(usageResult, undefined, idp)
-          
+
           // 更新数据库中的使用量和订阅信息
           const { sql, params } = buildUsageUpdateSQL(parsed, accountId)
           await pool.query(sql, params)
-          
+
           console.log(`[API] Usage info fetched for new account ${acc.email}: ${parsed.data.usage.current}/${parsed.data.usage.limit}`)
         } catch (usageError) {
           const errorMsg = usageError instanceof Error ? usageError.message : String(usageError)
           console.warn(`[API] Failed to fetch usage for new account ${acc.email}: ${errorMsg}`)
-          
+
           // 如果是被封禁，更新账号状态
           if (errorMsg.startsWith('BANNED:')) {
             try {
@@ -225,7 +225,7 @@ router.post('/api/accounts/verify-credentials', async (req, res) => {
 
     // 根据认证方式刷新 token 获取 accessToken（使用提取的公共函数）
     const tokenResult = await refreshTokenByAuthMethod(authMethod, refreshToken, clientId, clientSecret, region)
-    
+
     if (!tokenResult.success) {
       return res.status(400).json({ success: false, error: `Token 刷新失败: ${tokenResult.error}` })
     }
@@ -250,10 +250,10 @@ router.post('/api/accounts/verify-credentials', async (req, res) => {
     // 根据 headerVersion 选择端点URL
     const apiUrl = getEndpointUrl(tempAccount.headerVersion, tempAccount.credentials.region, 'usage')
     const fullUrl = `${apiUrl}?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST`
-    
+
     // 使用统一的 header 生成器
     const headers = generateHeaders(tempAccount, tokenResult.accessToken)
-    
+
     const apiResponse = await fetch(fullUrl, {
       method: 'GET',
       headers
@@ -332,28 +332,28 @@ router.post('/api/accounts/batch-delete', async (req, res) => {
   try {
     const { ids } = req.body
     console.log('[API] Batch delete request:', { ids, count: ids?.length })
-    
+
     if (!ids || ids.length === 0) {
       return res.json({ success: true, count: 0 })
     }
-    
+
     // 验证 ids 是否为有效的字符串数组
     if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id)) {
       console.error('[API] Invalid ids format:', ids)
       return res.status(400).json({ error: 'Invalid ids format: expected non-empty string array' })
     }
-    
+
     const now = Date.now()
     const placeholders = ids.map(() => '?').join(',')
     const sql = `UPDATE accounts SET is_del = TRUE, deleted_at = ? WHERE id IN (${placeholders})`
     const params = [now, ...ids]
-    
+
     console.log('[API] Executing SQL:', sql)
     console.log('[API] SQL params:', params)
-    
+
     // 软删除：设置 is_del = TRUE 和 deleted_at
     const [result] = await pool.query(sql, params)
-    
+
     console.log('[API] Batch delete result:', { affectedRows: result.affectedRows })
     res.json({ success: true, count: result.affectedRows })
   } catch (error) {
@@ -561,7 +561,7 @@ router.post('/api/accounts/:id/refresh-token', async (req, res) => {
       account.cred_client_secret,
       account.cred_region
     )
-    
+
     if (!result.success) {
       return res.status(400).json({ success: false, error: result.error })
     }
@@ -622,6 +622,67 @@ router.post('/api/accounts/:id/check-status', async (req, res) => {
     // 获取或创建机器码（使用提取的公共函数）
     const machineId = await getOrCreateMachineId(conn, id)
 
+    // 检查上次使用量刷新时间，如果距离上次刷新 < 5 分钟，则跳过刷新
+    const USAGE_REFRESH_MIN_INTERVAL = 5 * 60 * 1000 // 5分钟
+    const [usageRows] = await conn.query(
+      'SELECT usage_last_updated FROM accounts WHERE id = ?',
+      [id]
+    )
+
+    const lastUpdated = usageRows[0]?.usage_last_updated || 0
+    const timeSinceLastUpdate = Date.now() - lastUpdated
+
+    if (timeSinceLastUpdate < USAGE_REFRESH_MIN_INTERVAL) {
+      const remainingTime = Math.ceil((USAGE_REFRESH_MIN_INTERVAL - timeSinceLastUpdate) / 1000)
+      console.log(`[API] ⏭ Skipping usage refresh for ${account.email}: last updated ${Math.floor(timeSinceLastUpdate / 1000)}s ago (min interval: ${USAGE_REFRESH_MIN_INTERVAL / 1000}s, remaining: ${remainingTime}s)`)
+
+      // 返回数据库中的缓存数据
+      const [cachedRows] = await conn.query(
+        `SELECT usage_current, usage_limit, usage_percent_used, usage_last_updated,
+                usage_base_limit, usage_base_current,
+                usage_free_trial_limit, usage_free_trial_current, usage_free_trial_expiry,
+                usage_bonuses, usage_next_reset_date,
+                sub_type, sub_title, sub_days_remaining, sub_expires_at,
+                sub_raw_type, sub_upgrade_capability, sub_overage_capability, sub_management_target
+         FROM accounts WHERE id = ?`,
+        [id]
+      )
+
+      if (cachedRows.length > 0) {
+        const cached = cachedRows[0]
+        return res.json({
+          success: true,
+          cached: true,
+          timeSinceLastUpdate: Math.floor(timeSinceLastUpdate / 1000),
+          minInterval: USAGE_REFRESH_MIN_INTERVAL / 1000,
+          data: {
+            usage: {
+              current: cached.usage_current || 0,
+              limit: cached.usage_limit || 0,
+              percentUsed: cached.usage_percent_used || 0,
+              baseLimit: cached.usage_base_limit || 0,
+              baseCurrent: cached.usage_base_current || 0,
+              freeTrialLimit: cached.usage_free_trial_limit || 0,
+              freeTrialCurrent: cached.usage_free_trial_current || 0,
+              freeTrialExpiry: cached.usage_free_trial_expiry || null,
+              bonuses: cached.usage_bonuses ? JSON.parse(cached.usage_bonuses) : [],
+              nextResetDate: cached.usage_next_reset_date || null
+            },
+            subscription: {
+              type: cached.sub_type || 'unknown',
+              title: cached.sub_title || 'Unknown',
+              daysRemaining: cached.sub_days_remaining || 0,
+              expiresAt: cached.sub_expires_at || null,
+              rawType: cached.sub_raw_type || null,
+              upgradeCapability: cached.sub_upgrade_capability || null,
+              overageCapability: cached.sub_overage_capability || null,
+              managementTarget: cached.sub_management_target || null
+            }
+          }
+        })
+      }
+    }
+
     // 第一次尝试：使用当前 accessToken
     // 构造账号对象用于 API 调用
     const accountForApi = {
@@ -638,7 +699,7 @@ router.post('/api/accounts/:id/check-status', async (req, res) => {
         region: cred_region || 'us-east-1'
       }
     }
-    
+
     try {
       console.log(`[API] Calling getUsageLimits for ${account.email} (Header V${accountForApi.headerVersion})`)
       const usageResult = await getUsageLimits(cred_access_token, accountForApi)
