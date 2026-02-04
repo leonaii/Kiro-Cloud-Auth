@@ -12,7 +12,7 @@ import { estimateTokens } from '../../openai-compat/token-counter.js';
 /**
  * Stream state tracker
  */
-class StreamState {
+export class StreamState {
   constructor() {
     this.fullContent = '';
     this.thinkingContent = '';
